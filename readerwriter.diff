@@ -1,0 +1,175 @@
+diff --git a/Makefile b/Makefile
+index 91bdd6f..1a857c4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -154,6 +154,7 @@ UPROGS=\
+         $U/_peterson\
+         $U/_peterson\
+         $U/_prodcons\
++        $U/_readwrite\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+
+tets func
+diff --git a/user/readwrite.c b/user/readwrite.c
+new file mode 100644
+index 0000000..c55d788
+--- /dev/null
++++ b/user/readwrite.c
+@@ -0,0 +1,155 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++#define READERS 3
++#define WRITERS 2
++#define ROUNDS 3
++
++struct shared_data {
++  int value;
++  int read_count;
++};
++
++void
++reader(struct shared_data *s, int resource, int read_mutex, int service)
++{
++  for (int i = 0; i < ROUNDS; i++) {
++
++    // Turnstile: readers cannot bypass a waiting writer.
++    sem_wait(service);
++
++    sem_wait(read_mutex);
++    s->read_count++;
++
++    // First reader locks the shared resource.
++    if (s->read_count == 1)
++      sem_wait(resource);
++
++    sem_signal(read_mutex);
++
++    // Allow another reader/writer to enter the turnstile.
++    sem_signal(service);
++
++    printf("Reader PID %d: read value = %d, readers = %d\n",
++           getpid(), s->value, s->read_count);
++
++    // Reader finished.
++    sem_wait(read_mutex);
++    s->read_count--;
++
++    // Last reader releases the shared resource.
++    if (s->read_count == 0)
++      sem_signal(resource);
++
++    sem_signal(read_mutex);
++
++    // Small delay using yield.
++    for (volatile int j = 0; j < 50000; j++)
++      ;
++  }
++
++  printf("Reader PID %d finished\n", getpid());
++}
++
++void
++writer(struct shared_data *s, int resource, int service)
++{
++  for (int i = 0; i < ROUNDS; i++) {
++
++    // Enter turnstile before requesting the resource.
++    sem_wait(service);
++
++    // Writer gets exclusive access.
++    sem_wait(resource);
++
++    // Release turnstile so others can queue.
++    sem_signal(service);
++
++    s->value++;
++
++    printf("Writer PID %d: wrote value = %d\n",
++           getpid(), s->value);
++
++    // Release shared resource.
++    sem_signal(resource);
++
++    for (volatile int j = 0; j < 50000; j++)
++      ;
++  }
++
++  printf("Writer PID %d finished\n", getpid());
++}
++
++int
++main(void)
++{
++  struct shared_data *s;
++  uint64 addr;
++
++  int resource;
++  int read_mutex;
++  int service;
++
++  int pid;
++
++  addr = shm_get();
++
++  if (addr == 0) {
++    printf("shm_get failed\n");
++    exit(1);
++  }
++
++  s = (struct shared_data *)addr;
++
++  s->value = 0;
++  s->read_count = 0;
++
++  resource = sem_init(1);
++  read_mutex = sem_init(1);
++  service = sem_init(1);
++
++  if (resource < 0 || read_mutex < 0 || service < 0) {
++    printf("semaphore initialization failed\n");
++    exit(1);
++  }
++
++  // Create 3 readers.
++  for (int i = 0; i < READERS; i++) {
++    pid = fork();
++
++    if (pid < 0) {
++      printf("fork failed\n");
++      exit(1);
++    }
++
++    if (pid == 0) {
++      reader(s, resource, read_mutex, service);
++      exit(0);
++    }
++  }
++
++  // Create 2 writers.
++  for (int i = 0; i < WRITERS; i++) {
++    pid = fork();
++
++    if (pid < 0) {
++      printf("fork failed\n");
++      exit(1);
++    }
++
++    if (pid == 0) {
++      writer(s, resource, service);
++      exit(0);
++    }
++  }
++
++  // Parent waits for all 5 children.
++  for (int i = 0; i < READERS + WRITERS; i++)
++    wait(0);
++
++  printf("Readers-Writers test completed\n");
++  printf("Final shared value = %d\n", s->value);
++
++  exit(0);
++}

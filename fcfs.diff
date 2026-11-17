@@ -1,0 +1,150 @@
+--- /dev/null	2026-11-14 05:22:55.860081675 +0000
++++ asg3/fcfstest.c	2026-11-14 08:15:57.501468400 +0000
+@@ -0,0 +1,43 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++void
++cpu_work(int id)
++{
++  volatile int x = 0;
++  int i;
++  printf(1, "Process %d (pid %d) starting CPU work\n", id, getpid());
++  for(i = 0; i < 200000000; i++) x++;
++  printf(1, "Process %d (pid %d) finished\n", id, getpid());
++}
++
++int
++main(void)
++{
++  int pid1, pid2, pid3;
++  int i;
++
++  printf(1, "=== FCFS Scheduler Test ===\n\n");
++
++  pid1 = fork();
++  if(pid1 == 0){ cpu_work(1); exit(); }
++
++  for(i = 0; i < 50000000; i++);
++
++  pid2 = fork();
++  if(pid2 == 0){ cpu_work(2); exit(); }
++
++  for(i = 0; i < 50000000; i++);
++
++  pid3 = fork();
++  if(pid3 == 0){ cpu_work(3); exit(); }
++
++  wait();
++  wait();
++  wait();
++
++  printf(1, "\n=== Completion order should be: 1, 2, 3 ===\n");
++  printf(1, "=== fcfstest done ===\n");
++  exit();
++}
+--- xv6-clean/Makefile	2026-08-24 14:26:16.270868500 +0000
++++ asg3/Makefile	2026-11-14 08:16:01.396086500 +0000
+@@ -76,7 +76,7 @@
+ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+-CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32  -fno-omit-frame-pointer
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+@@ -157,7 +157,7 @@
+ 	$(OBJDUMP) -S _forktest > forktest.asm
+ 
+ mkfs: mkfs.c fs.h
+-	gcc -Werror -Wall -o mkfs mkfs.c
++	gcc  -Wall -o mkfs mkfs.c
+ 
+ # Prevent deletion of intermediate files, e.g. cat.o, after first build, so
+ # that disk image changes after first build are persistent until clean.  More
+@@ -180,7 +180,8 @@
+ 	_stressfs\
+ 	_usertests\
+ 	_wc\
+-	_zombie\
++	_zombie _fcfstest\
++	_fcfstest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+
+--- xv6-clean/proc.c	2026-08-24 14:26:16.677276700 +0000
++++ asg3/proc.c	2026-11-14 08:18:51.613887300 +0000
+@@ -88,6 +88,7 @@
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
++  p->ctime = ticks;  // Asg3 Q1: record creation time
+ 
+   release(&ptable.lock);
+ 
+@@ -323,35 +324,34 @@
+ scheduler(void)
+ {
+   struct proc *p;
++  struct proc *oldest;
+   struct cpu *c = mycpu();
+-  c->proc = 0;
+   
++  c->proc = 0;
++
+   for(;;){
+-    // Enable interrupts on this processor.
+     sti();
+-
+-    // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
++
++    // FCFS: pick the RUNNABLE process with the smallest ctime
++    oldest = 0;
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+       if(p->state != RUNNABLE)
+         continue;
++      if(oldest == 0 || p->ctime < oldest->ctime)
++        oldest = p;
++    }
+ 
+-      // Switch to chosen process.  It is the process's job
+-      // to release ptable.lock and then reacquire it
+-      // before jumping back to us.
+-      c->proc = p;
+-      switchuvm(p);
+-      p->state = RUNNING;
+-
+-      swtch(&(c->scheduler), p->context);
++    if(oldest != 0){
++      c->proc = oldest;
++      switchuvm(oldest);
++      oldest->state = RUNNING;
++      swtch(&(c->scheduler), oldest->context);
+       switchkvm();
+-
+-      // Process is done running for now.
+-      // It should have changed its p->state before coming back.
+       c->proc = 0;
+     }
+-    release(&ptable.lock);
+ 
++    release(&ptable.lock);
+   }
+ }
+ 
+--- xv6-clean/proc.h	2026-08-24 14:26:16.685268900 +0000
++++ asg3/proc.h	2026-11-14 08:18:51.593828500 +0000
+@@ -40,7 +40,8 @@
+   pde_t* pgdir;                // Page table
+   char *kstack;                // Bottom of kernel stack for this process
+   enum procstate state;        // Process state
+-  int pid;                     // Process ID
++  int pid;
++  int ctime;  // Asg3 Q1: creation time (ticks)                     // Process ID
+   struct proc *parent;         // Parent process
+   struct trapframe *tf;        // Trap frame for current syscall
+   struct context *context;     // swtch() here to run process

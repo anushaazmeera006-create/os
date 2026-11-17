@@ -1,0 +1,250 @@
+--- /home/anushaazmeera/xv6-clean/Makefile	2026-08-31 16:39:47.756545223 +0000
++++ /home/anushaazmeera/xv6-q2-hrrn/Makefile	2026-08-31 18:13:44.103734771 +0000
+@@ -146,6 +146,7 @@
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
++        $U/_hrrntest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+--- /home/anushaazmeera/xv6-clean/kernel/proc.c	2026-08-31 16:39:47.756545223 +0000
++++ /home/anushaazmeera/xv6-q2-hrrn/kernel/proc.c	2026-08-31 18:24:27.874811474 +0000
+@@ -123,6 +123,10 @@
+ 
+ found:
+   p->pid = allocpid();
++  // ===== Lab 4 Q2: HRRN Scheduler =====
++  p->ctime = ticks;
++  p->burst_time = 0;
++
+   p->state = USED;
+ 
+   // Allocate a trapframe page.
+@@ -425,50 +429,65 @@
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
++
++// ===== Lab 4 Q2: HRRN Scheduler =====
++// Non-preemptive Highest Response Ratio Next scheduler.
++
+ void
+ scheduler(void)
+ {
+   struct proc *p;
++  struct proc *highest;
+   struct cpu *c = mycpu();
++  int ratio;
++  int highest_ratio;
+ 
+   c->proc = 0;
++
+   for (;;) {
+-    // The most recent process to run may have had interrupts
+-    // turned off; enable them to avoid a deadlock if all
+-    // processes are waiting. Then turn them back off
+-    // to avoid a possible race between an interrupt
+-    // and wfi.
+     intr_on();
+     intr_off();
+ 
+-    int found = 0;
++    highest = 0;
++    highest_ratio = -1;
++
++    // Find the RUNNABLE process with the highest response ratio.
+     for (p = proc; p < &proc[NPROC]; p++) {
+       acquire(&p->lock);
++
+       if (p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Don't re-enable interrupts on release.
+-        mycpu()->intena = 0;
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
++        ratio = ((ticks - p->ctime + p->burst_time) * 100)
++                / p->burst_time;
++
++        if (highest == 0 || ratio > highest_ratio) {
++          if (highest != 0)
++            release(&highest->lock);
++
++          highest = p;
++          highest_ratio = ratio;
++          continue;
++        }
+       }
++
+       release(&p->lock);
+     }
+-    if (found == 0) {
+-      // nothing to run; stop running on this core until an interrupt.
++
++    if (highest != 0) {
++      highest->state = RUNNING;
++      c->proc = highest;
++
++      swtch(&c->context, &highest->context);
++
++      mycpu()->intena = 0;
++      c->proc = 0;
++
++      release(&highest->lock);
++    } else {
+       asm volatile("wfi");
+     }
+   }
+ }
+-
++ 
+ // Switch to scheduler.  Must hold only p->lock
+ // and have changed proc->state. Saves and restores
+ // intena because intena is a property of this
+ --- /home/anushaazmeera/xv6-clean/kernel/proc.h	2026-08-31 16:39:47.756545223 +0000
++++ /home/anushaazmeera/xv6-q2-hrrn/kernel/proc.h	2026-08-31 17:58:50.780899187 +0000
+@@ -88,7 +88,9 @@
+   int killed;           // If non-zero, have been killed
+   int xstate;           // Exit status to be returned to parent's wait
+   int pid;              // Process ID
+-
++  // ===== Lab 4 Q2: HRRN Scheduler =====
++  int ctime;       // Process creation time
++  int burst_time;  // Expected CPU burst time
+   // wait_lock must be held when using this:
+   struct proc *parent; // Parent process
+ --- /home/anushaazmeera/xv6-clean/kernel/syscall.c	2026-08-31 16:39:47.760545222 +0000
++++ /home/anushaazmeera/xv6-q2-hrrn/kernel/syscall.c	2026-08-31 18:26:44.515057027 +0000
+@@ -103,6 +103,8 @@
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
++// ===== Lab 4 Q2: HRRN Scheduler =====
++extern uint64 sys_set_burst(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -130,6 +132,7 @@
+   [SYS_mkdir]   sys_mkdir,
+   [SYS_close]   sys_close,
+   [SYS_sync]    sys_sync,
++  [SYS_set_burst] sys_set_burst,
+   // clang-format on
+ };
+ --- /home/anushaazmeera/xv6-clean/kernel/syscall.h	2026-08-31 16:39:47.760545222 +0000
++++ /home/anushaazmeera/xv6-q2-hrrn/kernel/syscall.h	2026-08-31 18:08:09.368428870 +0000
+@@ -21,3 +21,5 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_sync   22
++// ===== Lab 4 Q2: HRRN Scheduler =====
++#define SYS_set_burst 23
+
+
+--- /home/anushaazmeera/xv6-clean/kernel/sysproc.c	2026-08-31 16:39:47.760545222 +0000
++++ /home/anushaazmeera/xv6-q2-hrrn/kernel/sysproc.c	2026-08-31 18:09:13.285632234 +0000
+@@ -110,3 +110,21 @@
+   release(&tickslock);
+   return xticks;
+ }
++// ===== Lab 4 Q2: HRRN Scheduler =====
++uint64
++sys_set_burst(void)
++{
++  int bt;
++  struct proc *p = myproc();
++
++  argint(0, &bt);
++
++  if(bt <= 0)
++    return -1;
++
++  acquire(&p->lock);
++  p->burst_time = bt;
++  release(&p->lock);
++
++  return 0;
++}
+--- /home/anushaazmeera/xv6-clean/user/user.h	2026-08-31 16:39:47.760545222 +0000
++++ /home/anushaazmeera/xv6-q2-hrrn/user/user.h	2026-08-31 18:10:02.360464523 +0000
+@@ -5,6 +5,7 @@
+ // system calls
+ int fork(void);
+ int exit(int) __attribute__((noreturn));
++int set_burst(int);
+ int wait(int *);
+ int pipe(int *);
+ int write(int, const void *, int);
+
+--- /home/anushaazmeera/xv6-clean/user/usys.pl	2026-08-31 16:39:47.760545222 +0000
++++ /home/anushaazmeera/xv6-q2-hrrn/user/usys.pl	2026-08-31 18:10:40.437351810 +0000
+@@ -43,3 +43,4 @@
+ entry("pause");
+ entry("uptime");
+ entry("sync");
++entry("set_burst");
+
+
+
+test func 
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+
+void
+run_job(char *name, int burst)
+{
+  int pid = getpid();
+
+  printf("%s started: PID %d, burst %d\n", name, pid, burst);
+
+  if(set_burst(burst) < 0){
+    printf("%s: set_burst failed\n", name);
+    exit(1);
+  }
+
+  // Consume CPU time.
+  for(volatile int i = 0; i < burst * 1000000; i++)
+    ;
+
+  printf("%s completed: PID %d\n", name, pid);
+  exit(0);
+}
+
+int
+main(void)
+{
+  int pid;
+
+  printf("HRRN Test Started\n");
+
+  pid = fork();
+  if(pid == 0)
+    run_job("Long job", 100);
+
+  pid = fork();
+  if(pid == 0)
+    run_job("Medium job", 30);
+
+  pid = fork();
+  if(pid == 0)
+    run_job("Short job", 10);
+
+  wait(0);
+  wait(0);
+  wait(0);
+
+  printf("HRRN Test Finished\n");
+  exit(0);
+}
+
+

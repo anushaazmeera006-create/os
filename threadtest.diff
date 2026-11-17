@@ -1,0 +1,412 @@
+diff --git a/user/usys.pl b/user/usys.pl
+index 4d054e8..2b02b0f 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -43,3 +43,5 @@ entry("sbrk");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
++entry("clone");
++entry("join");
+diff --git a/user/user.h b/user/user.h
+index 29aad59..377d217 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -4,6 +4,11 @@ struct stat;
+ 
+ // system calls
+ int fork(void);
++// Create a thread that shares the caller's user memory.
++int clone(void (*fcn)(void *), void *arg, void *stack);
++
++// Wait for one child thread and reclaim its resources.
++int join(void);
+ int exit(int) __attribute__((noreturn));
+ int wait(int *);
+ int pipe(int *);
+diff --git a/user/threadtest.c b/user/threadtest.c
+new file mode 100644
+index 0000000..4541f7e
+--- /dev/null
++++ b/user/threadtest.c
+@@ -0,0 +1,56 @@
++#include "kernel/types.h"
++#include "kernel/riscv.h"
++#include "user/user.h"
++
++#define NTHREADS 3
++#define ITERATIONS 100000
++
++// Q1: all cloned threads see this one shared global variable.
++volatile int counter = 0;
++
++// Each clone() call receives its own page-aligned, one-page user stack.
++char stacks[NTHREADS][PGSIZE] __attribute__((aligned(PGSIZE)));
++
++void
++worker(void *arg)
++{
++  int id = (int)(uint64)arg;
++  int i;
++
++  // Deliberately unsynchronized: Q2 will protect this critical section.
++  for (i = 0; i < ITERATIONS; i++)
++    counter++;
++
++  printf("thread %d finished\n", id);
++
++  // A thread must call exit() when its function finishes.
++  exit(0);
++}
++
++int
++main(void)
++{
++  int i;
++
++  printf("threadtest: creating %d threads\n", NTHREADS);
++
++  for (i = 0; i < NTHREADS; i++) {
++    if (clone(worker, (void *)(uint64)(i + 1), stacks[i]) < 0) {
++      printf("threadtest: clone failed\n");
++      exit(1);
++    }
++  }
++
++  for (i = 0; i < NTHREADS; i++) {
++    if (join() < 0) {
++      printf("threadtest: join failed\n");
++      exit(1);
++    }
++  }
++
++  printf("threadtest: counter = %d; expected %d\n",
++         counter, NTHREADS * ITERATIONS);
++  printf("threadtest: a value below %d demonstrates the Q1 race condition\n",
++         NTHREADS * ITERATIONS);
++  exit(0);diff --git a/Makefile b/Makefile
+index f59a9ad..f9ac1f5 100644
+--- a/Makefile
++++ b/Makefile
+@@ -146,6 +146,7 @@ UPROGS=\
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
++        $U/_threadtest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+
++}
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index cd25557..cea514a 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -110,3 +110,23 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++// Q1: read the user arguments and create a thread in the caller's address space.
++uint64
++sys_clone(void)
++{
++  uint64 fcn;
++  uint64 arg;
++  uint64 stack;
++
++  argaddr(0, &fcn);
++  argaddr(1, &arg);
++  argaddr(2, &stack);
++  return kclone(fcn, arg, stack);
++}
++
++// Q1: wait for one child thread to exit and reclaim its kernel resources.
++uint64
++sys_join(void)
++{
++  return kjoin();
++}
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 0cd8051..92cf0e5 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -103,6 +103,8 @@ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
++extern uint64 sys_clone(void);
++extern uint64 sys_join(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -130,6 +132,9 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_mkdir]   sys_mkdir,
+   [SYS_close]   sys_close,
+   [SYS_sync]    sys_sync,
++  [SYS_clone]   sys_clone,
++  [SYS_join]    sys_join,
++
+   // clang-format on
+ };
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 5603697..63ad03b 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -91,6 +91,10 @@ struct proc {
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent; // Parent process
++  // Q1: cloned threads share the leader's user-memory pages.
++  // Each thread still needs its own trapframe and page-table root on RISC-V.
++  int is_thread;
++  struct proc *thread_leader;
+ 
+   // these are private to the process, so p->lock need not be held.
+   uint64 kstack;               // Virtual address of kernel stack
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 6275411..23427fa 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -124,6 +124,8 @@ allocproc(void)
+ found:
+   p->pid = allocpid();
+   p->state = USED;
++  p->is_thread = 0;
++  p->thread_leader = 0;
+ 
+   // Allocate a trapframe page.
+   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
+@@ -149,6 +151,42 @@ found:
+   return p;
+ }
+ 
++// Q1: remove a thread's mappings without freeing the physical user pages.
++// Those pages belong to the thread-group leader and may still be used by
++// other threads.
++static void
++thread_freepagetable(pagetable_t pagetable, uint64 sz)
++{
++  uint64 va;
++
++  for (va = 0; va < sz; va += PGSIZE) {
++    pte_t *pte = walk(pagetable, va, 0);
++    if (pte != 0 && (*pte & PTE_V))
++      uvmunmap(pagetable, va, 1, 0);
++  }
++
++  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++  uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  uvmfree(pagetable, 0);
++}
++
++// Q1: map every existing user page from src into dst at the same virtual
++// address. The physical pages are shared; only the page-table pages differ.
++static int
++share_user_memory(pagetable_t src, pagetable_t dst, uint64 sz)
++{
++  uint64 va;
++
++  for (va = 0; va < sz; va += PGSIZE) {
++    pte_t *pte = walk(src, va, 0);
++    if (pte == 0 || (*pte & PTE_V) == 0)
++      continue;
++
++    if (mappages(dst, va, PGSIZE, PTE2PA(*pte), PTE_FLAGS(*pte)) != 0)
++      return -1;
++  }
++  return 0;
++}
+ // free a proc structure and the data hanging from it,
+ // including user pages.
+ // p->lock must be held.
+@@ -158,8 +196,12 @@ freeproc(struct proc *p)
+   if (p->trapframe)
+     kfree((void *)p->trapframe);
+   p->trapframe = 0;
+-  if (p->pagetable)
+-    proc_freepagetable(p->pagetable, p->sz);
++  if (p->pagetable) {
++    if (p->is_thread)
++      thread_freepagetable(p->pagetable, p->sz);
++    else
++      proc_freepagetable(p->pagetable, p->sz);
++  }
+   p->pagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+@@ -167,6 +209,8 @@ freeproc(struct proc *p)
+   p->chan = 0;
+   p->killed = 0;
+   p->xstate = 0;
++  p->is_thread = 0;
++  p->thread_leader = 0;
+   p->state = UNUSED;
+ }
+ 
+@@ -304,6 +348,64 @@ kfork(void)
+   return pid;
+ }
+ 
++// Q1: create a runnable thread that shares the leader's physical user pages.
++int
++kclone(uint64 fcn, uint64 arg, uint64 stack)
++{
++  int i;
++  int pid;
++  struct proc *np;
++  struct proc *p = myproc();
++  struct proc *leader = p->is_thread ? p->thread_leader : p;
++
++  // The test program supplies one page-aligned, one-page user stack.
++  if (fcn >= leader->sz || stack == 0 || (stack % PGSIZE) != 0 ||
++      stack + PGSIZE < stack || stack + PGSIZE > leader->sz ||
++      walkaddr(leader->pagetable, stack) == 0)
++    return -1;
++
++  if ((np = allocproc()) == 0)
++    return -1;
++
++  // A thread has a separate trapframe/page-table root on RISC-V, but every
++  // user virtual page maps to the same physical page as the group leader.
++  np->is_thread = 1;
++  np->thread_leader = leader;
++  np->sz = leader->sz;
++
++  if (share_user_memory(leader->pagetable, np->pagetable, np->sz) < 0) {
++    freeproc(np);
++    release(&np->lock);
++    return -1;
++  }
++
++  // Start at fcn(arg), using the caller-supplied stack page.
++  *(np->trapframe) = *(p->trapframe);
++  np->trapframe->epc = fcn;
++  np->trapframe->sp = (stack + PGSIZE) & ~0xFUL;
++  np->trapframe->a0 = arg;
++
++  // Give the thread usable copies of the caller's open files and directory.
++  for (i = 0; i < NOFILE; i++)
++    if (p->ofile[i])
++      np->ofile[i] = filedup(p->ofile[i]);
++  np->cwd = idup(p->cwd);
++  safestrcpy(np->name, p->name, sizeof(np->name));
++
++  pid = np->pid;
++  release(&np->lock);
++
++  // All threads belong to the leader, so the leader can join every thread.
++  acquire(&wait_lock);
++  np->parent = leader;
++  release(&wait_lock);
++
++  acquire(&np->lock);
++  np->state = RUNNABLE;
++  release(&np->lock);
++
++  return pid;
++}
+ // Pass p's abandoned children to init.
+ // Caller must hold wait_lock.
+ void
+@@ -327,9 +429,16 @@ kexit(int status)
+ {
+   struct proc *p = myproc();
+ 
+-  if (p == initproc)
++    if (p == initproc)
+     panic("init exiting");
+ 
++      // Q1: the group leader must reap all threads before its shared memory
++  // can be released.
++   if (!p->is_thread) {
++     while (kjoin() >= 0)
++      ;
++   }
++
+   // Close all open files.
+   for (int fd = 0; fd < NOFILE; fd++) {
+     if (p->ofile[fd]) {
+@@ -379,7 +488,7 @@ kwait(uint64 addr)
+     // Scan through table looking for exited children.
+     havekids = 0;
+     for (pp = proc; pp < &proc[NPROC]; pp++) {
+-      if (pp->parent == p) {
++      if (pp->parent == p && !pp->is_thread) {
+         // make sure the child isn't still in exit() or swtch().
+         acquire(&pp->lock);
+ 
+@@ -418,6 +527,51 @@ kwait(uint64 addr)
+   }
+ }
+ 
++// Q1: wait for one child thread of the group leader to finish.
++int
++kjoin(void)
++{
++  struct proc *pp;
++  struct proc *p = myproc();
++  int have_threads;
++  int pid;
++
++  // clone() assigns every thread to its group leader.
++  if (p->is_thread)
++    return -1;
++
++  acquire(&wait_lock);
++  for (;;) {
++    have_threads = 0;
++
++    for (pp = proc; pp < &proc[NPROC]; pp++) {
++      if (pp->parent == p && pp->is_thread) {
++        acquire(&pp->lock);
++        have_threads = 1;
++
++        if (pp->state == ZOMBIE) {
++          pid = pp->pid;
++          pp->parent = 0;
++          freeproc(pp);
++          release(&pp->lock);
++          release(&wait_lock);
++          return pid;
++        }
++        release(&pp->lock);
++      }
++    }
++
++    if (!have_threads || killed(p)) {
++      release(&wait_lock);
++      return -1;
++    }
++
++    sleep_prepare(p);
++    release(&wait_lock);
++    sleep();
++    acquire(&wait_lock);
++  }
++}
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+ // Scheduler never returns.  It loops, doing:
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 0ae6896..1356240 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -82,6 +82,9 @@ void            printkinit(void);
+ int             cpuid(void);
+ void            kexit(int);
+ int             kfork(void);
++// Q1: thread lifecycle helpers implemented in proc.c.
++int             kclone(uint64, uint64, uint64);
++int             kjoin(void);
+ int             growproc(int);
+ void            proc_mapstacks(pagetable_t);
+ pagetable_t     proc_pagetable(struct proc *);
+@@ -104,6 +107,7 @@ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
+ 
++
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+ 

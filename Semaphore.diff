@@ -1,0 +1,515 @@
+diff --git a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/kernel/defs.h b/kernel/defs.h
+index 1356240..357d799 100644
+--- a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/kernel/defs.h
++++ b/kernel/defs.h
+@@ -111,6 +111,11 @@ void            procdump(void);
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+ 
++// semaphore.c
++void            seminit(void);
++int             ksem_init(int, int);
++int             ksem_wait(int);
++int             ksem_signal(int);
+ // spinlock.c
+ void            acquire(struct spinlock*);
+ int             holding(struct spinlock*);
+--- /tmp/q2_original_main.c	2026-10-12 18:42:34.061963832 +0000
++++ kernel/main.c	2026-10-12 17:46:52.781633746 +0000
+@@ -20,6 +20,8 @@
+     kvminit();          // create kernel page table
+     kvminithart();      // turn on paging
+     procinit();         // process table
++    // Q2: initialize the fixed kernel semaphore table.
++    seminit();
+     trapinit();         // trap vectors
+     trapinithart();     // install kernel trap vector
+     plicinit();         // set up interrupt controller
+diff --git a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/Makefile b/Makefile
+index 0356ced..a241dae 100644
+--- a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/Makefile
++++ b/Makefile
+@@ -13,6 +13,7 @@ OBJS = \
+   $K/main.o \
+   $K/vm.o \
+   $K/proc.o \
++  $K/semaphore.o \
+   $K/swtch.o \
+   $K/trampoline.o \
+   $K/trap.o \
+@@ -146,7 +147,9 @@ UPROGS=\
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
+-  $U/_threadtest\
++        $U/_threadtest\
++        $U/_semtest\
++        $U/_synctest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/semaphore.c b/kernel/semaphore.c
+new file mode 100644
+index 0000000..22a433d
+--- /dev/null
++++ b/kernel/semaphore.c
+@@ -0,0 +1,109 @@
++#include "types.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "param.h"
++#include "proc.h"
++#include "defs.h"
++#include "semaphore.h"
++
++static struct semaphore semaphores[NSEM];
++static struct spinlock semtable_lock;
++
++// Return the fixed-array entry for sem_id, or zero for an invalid ID.
++static struct semaphore *
++get_semaphore(int sem_id)
++{
++  if (sem_id < 0 || sem_id >= NSEM)
++    return 0;
++  return &semaphores[sem_id];
++}
++
++// Q2: initialize the fixed kernel semaphore table during xv6 boot.
++void
++seminit(void)
++{
++  int i;
++
++  initlock(&semtable_lock, "semtable");
++  for (i = 0; i < NSEM; i++) {
++    semaphores[i].value = 0;
++    semaphores[i].initialized = 0;
++    initlock(&semaphores[i].lk, "semaphore");
++  }
++}
++
++// Q2: initialize a counting semaphore with a non-negative permit count.
++int
++ksem_init(int sem_id, int value)
++{
++  struct semaphore *sem = get_semaphore(sem_id);
++
++  if (sem == 0 || value < 0)
++    return -1;
++
++  acquire(&semtable_lock);
++  acquire(&sem->lk);
++  sem->value = value;
++  sem->initialized = 1;
++  release(&sem->lk);
++  release(&semtable_lock);
++
++  return 0;
++}
++
++// Q2: consume one permit. Sleep while no permit is available.
++int
++ksem_wait(int sem_id)
++{
++  struct semaphore *sem = get_semaphore(sem_id);
++
++  if (sem == 0)
++    return -1;
++
++  acquire(&semtable_lock);
++  acquire(&sem->lk);
++  if (!sem->initialized) {
++    release(&sem->lk);
++    release(&semtable_lock);
++    return -1;
++  }
++  release(&semtable_lock);
++
++  while (sem->value == 0) {
++    // Register the sleep channel before releasing the semaphore lock so a
++    // signal cannot be lost between the value check and sleep().
++    sleep_prepare(sem);
++    release(&sem->lk);
++    sleep();
++    acquire(&sem->lk);
++  }
++
++  sem->value--;
++  release(&sem->lk);
++  return 0;
++}
++
++// Q2: return one permit and wake processes waiting for this semaphore.
++int
++ksem_signal(int sem_id)
++{
++  struct semaphore *sem = get_semaphore(sem_id);
++
++  if (sem == 0)
++    return -1;
++
++  acquire(&semtable_lock);
++  acquire(&sem->lk);
++  if (!sem->initialized) {
++    release(&sem->lk);
++    release(&semtable_lock);
++    return -1;
++  }
++
++  sem->value++;
++  release(&sem->lk);
++  release(&semtable_lock);
++
++  wakeup(sem);
++  return 0;
++}
+diff --git a/kernel/semaphore.h b/kernel/semaphore.h
+new file mode 100644
+index 0000000..f714c69
+--- /dev/null
++++ b/kernel/semaphore.h
+@@ -0,0 +1,21 @@
++#ifndef SEMAPHORE_H
++#define SEMAPHORE_H
++
++#include "spinlock.h"
++
++#define NSEM 10
++
++// Q2: one kernel-resident counting semaphore.
++struct semaphore {
++  int value;
++  int initialized;
++  struct spinlock lk;
++};
++
++void seminit(void);
++int ksem_init(int sem_id, int value);
++int ksem_wait(int sem_id);
++int ksem_signal(int sem_id);
++
++#endif
++
+diff --git a/user/semtest.c b/user/semtest.c
+new file mode 100644
+index 0000000..8092e1c
+--- /dev/null
++++ b/user/semtest.c
+@@ -0,0 +1,29 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(void)
++{
++  printf("semtest: starting\n");
++
++  if (sem_init(0, 1) < 0) {
++    printf("semtest: init failed\n");
++    exit(1);
++  }
++
++  if (sem_wait(0) < 0) {
++    printf("semtest: wait failed\n");
++    exit(1);
++  }
++
++  printf("semtest: wait passed\n");
++
++  if (sem_signal(0) < 0) {
++    printf("semtest: signal failed\n");
++    exit(1);
++  }
++
++  printf(--- /tmp/q2_original_spinlock.h	2026-10-12 18:42:34.089963824 +0000
++++ kernel/spinlock.h	2026-10-12 18:23:22.058583721 +0000
+@@ -1,3 +1,5 @@
++#ifndef SPINLOCK_H
++#define SPINLOCK_H
+ // Mutual exclusion lock.
+ struct spinlock {
+   uint locked; // Is the lock held?
+@@ -6,3 +8,4 @@
+   char *name;      // Name of lock.
+   struct cpu *cpu; // The cpu holding the lock.
+ };
++#endif
+"semtest: PASS\n");
++  exit(0);
++}
+diff --git a/user/synctest.c b/user/synctest.c
+new file mode 100644
+index 0000000..55520d4
+--- /dev/null
++++ b/user/synctest.c
+@@ -0,0 +1,168 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#define PGSIZE 4096
++
++#define NTHREADS 3
++#define ITERATIONS 100000
++#define BUFSIZE 5
++#define ITEMS 10
++#define STACKSIZE 4096
++
++#define SEM_COUNTER 0
++#define SEM_EMPTY   1
++#define SEM_FULL    2
++#define SEM_MUTEX   3
++
++volatile int counter = 0;
++
++int buffer[BUFSIZE];
++int in = 0;
++int out = 0;
++int produced = 0;
++int consumed = 0;
++
++char counter_stacks[NTHREADS][PGSIZE] __attribute__((aligned(PGSIZE)));
++char pc_stacks[2][PGSIZE] __attribute__((aligned(PGSIZE)));
++
++void
++counter_worker(void *arg)
++{
++  int i;
++  (void)arg;
++
++  for(i = 0; i < ITERATIONS; i++){
++    sem_wait(SEM_COUNTER);
++    counter++;
++    sem_signal(SEM_COUNTER);
++  }
++
++  exit(0);
++}
++
++void
++producer(void *arg)
++{
++  int i;
++  (void)arg;
++
++  for(i = 1; i <= ITEMS; i++){
++    sem_wait(SEM_EMPTY);
++    sem_wait(SEM_MUTEX);
++
++    buffer[in] = i;
++    in = (in + 1) % BUFSIZE;
++    produced++;
++    printf("Produced: %d\n", i);
++
++    sem_signal(SEM_MUTEX);
++    sem_signal(SEM_FULL);
++  }
++
++  exit(0);
++}
++
++void
++consumer(void *arg)
++{
++  int item;
++  (void)arg;
++
++  for(int i = 0; i < ITEMS; i++){
++    sem_wait(SEM_FULL);
++    sem_wait(SEM_MUTEX);
++
++    item = buffer[out];
++    out = (out + 1) % BUFSIZE;
++    consumed++;
++    printf("Consumed: %d\n", item);
++
++    sem_signal(SEM_MUTEX);
++    sem_signal(SEM_EMPTY);
++  }
++
++  exit(0);
++}
++
++int
++main(void)
++{
++  int i;
++  int failed = 0;
++
++  printf("\n=== Synchronized Counter Test ===\n");
++
++  counter = 0;
++  if(sem_init(SEM_COUNTER, 1) < 0){
++    printf("FAIL: counter semaphore initialization\n");
++    exit(1);
++  }
++
++  for(i = 0; i < NTHREADS; i++){
++    if(clone(counter_worker, 0, counter_stacks[i]) < 0){
++       printf("FAIL: clone counter thread\n");
++       exit(1);
++     }
++  }
++
++  for(i = 0; i < NTHREADS; i++){
++    if(join() < 0){
++      printf("FAIL: join counter thread\n");
++      failed = 1;
++    }
++    
++  }
++
++  printf("Final counter: %d (expected 300000)\n", counter);
++
++  if(counter != 300000)
++    failed = 1;
++
++  if(!failed)
++    printf("Counter test: PASS\n");
++  else
++    printf("Counter test: FAIL\n");
++
++  printf("\n=== Producer-Consumer Test ===\n");
++
++  in = 0;
++  out = 0;
++  produced = 0;
++  consumed = 0;
++
++  if(sem_init(SEM_EMPTY, BUFSIZE) < 0 ||
++     sem_init(SEM_FULL, 0) < 0 ||
++     sem_init(SEM_MUTEX, 1) < 0){
++    printf("FAIL: producer-consumer semaphore initialization\n");
++    exit(1);
++  }
++
++  if(clone(producer, 0, pc_stacks[0]) < 0){
++    printf("FAIL: clone producer\n");
++    exit(1);
++  }
++  if(clone(consumer, 0, pc_stacks[1]) < 0){
++   printf("FAIL: clone consumer\n");
++   exit(1);
++  }
++
++  if(join() < 0 || join() < 0){
++    printf("FAIL: join producer-consumer threads\n");
++    failed = 1;
++  }
++
++  
++
++  printf("Produced total: %d\n", produced);
++  printf("Consumed total: %d\n", consumed);
++
++  if(produced != ITEMS || consumed != ITEMS)
++    failed = 1;
++
++  if(!failed)
++    printf("Producer-Consumer test: PASS\n");
++  else
++    printf("Q2 synchronization test: FAIL\n");
++
++  exit(failed);
++}
+diff --git a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/kernel/syscall.c b/kernel/syscall.c
+index 92cf0e5..cac3b46 100644
+--- a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -105,6 +105,9 @@ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
+ extern uint64 sys_clone(void);
+ extern uint64 sys_join(void);
++extern uint64 sys_sem_init(void);
++extern uint64 sys_sem_wait(void);
++extern uint64 sys_sem_signal(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -134,6 +137,9 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_sync]    sys_sync,
+   [SYS_clone]   sys_clone,
+   [SYS_join]    sys_join,
++  [SYS_sem_init]   sys_sem_init,
++  [SYS_sem_wait]   sys_sem_wait,
++  [SYS_sem_signal] sys_sem_signal,
+ 
+   // clang-format on
+ };
+diff --git a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/kernel/syscall.h b/kernel/syscall.h
+index 9bd4673..423e430 100644
+--- a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -24,3 +24,7 @@
+ // Q1: kernel-supported user threads.
+ #define SYS_clone 23
+ #define SYS_join  24
++// Q2: counting semaphore system calls.
++#define SYS_sem_init   25
++#define SYS_sem_wait   26
++#define SYS_sem_signal 27
+diff --git a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/kernel/sysproc.c b/kernel/sysproc.c
+index cea514a..374fd06 100644
+--- a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -130,3 +130,34 @@ sys_join(void)
+ {
+   return kjoin();
+ }
++// Q2: initialize a semaphore identified by sem_id.
++uint64
++sys_sem_init(void)
++{
++  int sem_id;
++  int value;
++
++  argint(0, &sem_id);
++  argint(1, &value);
++  return ksem_init(sem_id, value);
++}
++
++// Q2: wait until one semaphore permit is available.
++uint64
++sys_sem_wait(void)
++{
++  int sem_id;
++
++  argint(0, &sem_id);
++  return ksem_wait(sem_id);
++}
++
++// Q2: release one semaphore permit.
++uint64
++sys_sem_signal(void)
++{
++  int sem_id;
++
++  argint(0, &sem_id);
++  return ksem_signal(sem_id);
++}
+diff --git a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/user/user.h b/user/user.h
+index 377d217..2f9b2d4 100644
+--- a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/user/user.h
++++ b/user/user.h
+@@ -9,6 +9,10 @@ int clone(void (*fcn)(void *), void *arg, void *stack);
+ 
+ // Wait for one child thread and reclaim its resources.
+ int join(void);
++// Q2: kernel counting semaphore operations.
++int sem_init(int sem_id, int value);
++int sem_wait(int sem_id);
++int sem_signal(int sem_id);
+ int exit(int) __attribute__((noreturn));
+ int wait(int *);
+ int pipe(int *);
+diff --git a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/user/usys.pl b/user/usys.pl
+index 2b02b0f..c859109 100755
+--- a/home/anushaazmeera/ASSIGN7_2401mc05/Q1_threads/modified_files/user/usys.pl
++++ b/user/usys.pl
+@@ -45,3 +45,6 @@ entry("uptime");
+ entry("sync");
+ entry("clone");
+ entry("join");
++entry("sem_init");
++entry("sem_wait");
++entry("sem_signal");

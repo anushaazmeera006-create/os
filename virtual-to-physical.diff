@@ -1,0 +1,186 @@
+--- /home/anushaazmeera/assignment/originals/kernel_defs.h.original	2026-10-19 17:05:04.463996550 +0000
++++ kernel/defs.h	2026-10-19 17:22:39.682929736 +0000
+@@ -170,6 +170,7 @@
+ int             copyinstr(pagetable_t, uint64, char *, uint64, uint64);
+ int             ismapped(pagetable_t, uint64);
+ uint64          vmfault(pagetable_t, uint64, uint64, int);
++uint64          sys_va2pa(void);
+ 
+ // plic.c
+ void            plicinit(void);
+@@ -184,3 +185,5 @@
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x) / sizeof((x)[0]))
++
++
+--- /home/anushaazmeera/assignment/originals/kernel_syscall.c.original	2026-10-19 17:05:04.484492205 +0000
++++ kernel/syscall.c	2026-10-19 17:13:15.615280753 +0000
+@@ -93,6 +93,7 @@
+ extern uint64 sys_dup(void);
+ extern uint64 sys_getpid(void);
+ extern uint64 sys_sbrk(void);
++extern uint64 sys_va2pa(void);
+ extern uint64 sys_pause(void);
+ extern uint64 sys_uptime(void);
+ extern uint64 sys_open(void);
+@@ -120,6 +121,7 @@
+   [SYS_dup]     sys_dup,
+   [SYS_getpid]  sys_getpid,
+   [SYS_sbrk]    sys_sbrk,
++  [SYS_va2pa]   sys_va2pa,
+   [SYS_pause]   sys_pause,
+   [SYS_uptime]  sys_uptime,
+   [SYS_open]    sys_open,
+--- /home/anushaazmeera/assignment/originals/user_usys.pl.original	2026-10-19 17:05:04.512439558 +0000
++++ user/usys.pl	2026-10-19 17:14:49.309933713 +0000
+@@ -40,6 +40,7 @@
+ entry("dup");
+ entry("getpid");
+ entry("sbrk");
++entry("va2pa");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
+--- /home/anushaazmeera/assignment/originals/kernel_syscall.h.original	2026-10-19 17:05:04.474943688 +0000
++++ kernel/syscall.h	2026-10-19 17:11:56.862732014 +0000
+@@ -21,3 +21,4 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_sync   22
++#define SYS_va2pa  23
+--- /home/anushaazmeera/assignment/originals/kernel_sysproc.c.original	2026-10-19 17:05:04.493576291 +0000
++++ kernel/sysproc.c	2026-10-19 17:26:25.221938451 +0000
+@@ -110,3 +110,32 @@
+   release(&tickslock);
+   return xticks;
+ }
++uint64
++sys_va2pa(void)
++{
++  uint64 va;
++  argaddr(0, &va);
++
++  struct proc *p = myproc();
++  pte_t *pte = walk(p->pagetable, va, 0);
++
++  if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) {
++    printk("va2pa: va=%p is unmapped or not user accessible\n", (void*)va);
++    return (uint64)-1;
++  }
++
++  uint64 pa = PTE2PA(*pte) | (va & (PGSIZE - 1));
++  int present = (*pte & PTE_V) != 0;
++  int writable = (*pte & PTE_W) != 0;
++  int user = (*pte & PTE_U) != 0;
++
++  printk("va2pa: va=%p pa=%p L2=%d L1=%d L0=%d offset=%d P=%d W=%d U=%d\n",
++          (void*)va, (void*)pa,
++         (int)((va >> 30) & 0x1ff),
++         (int)((va >> 21) & 0x1ff),
++         (int)((va >> 12) & 0x1ff),
++         (int)(va & (PGSIZE - 1)),
++         present, writable, user);
++
++  return pa;
++}
+--- /home/anushaazmeera/assignment/originals/Makefile.original	2026-10-19 17:05:04.522131007 +0000
++++ Makefile	2026-10-19 17:16:57.913490191 +0000
+@@ -146,6 +146,7 @@
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
++	$U/_vatest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+--- /home/anushaazmeera/assignment/originals/user_user.h.original	2026-10-19 17:05:04.501814705 +0000
++++ user/user.h	2026-10-19 17:14:23.599750595 +0000
+@@ -39,6 +39,7 @@
+ int memcmp(const void *, const void *, uint);
+ void *memcpy(void *, const void *, uint);
+ char *sbrk(int);
++uint64 va2pa(uint64);
+ char *sbrklazy(int);
+ --- /home/anushaazmeera/assignment/originals/user_usys.pl.original	2026-10-19 17:05:04.512439558 +0000
++++ user/usys.pl	2026-10-19 17:14:49.309933713 +0000
+@@ -40,6 +40,7 @@
+ entry("dup");
+ entry("getpid");
+ entry("sbrk");
++entry("va2pa");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
+
+ // printf.c
+ --- /home/anushaazmeera/assignment/originals/user_usys.pl.original	2026-10-19 17:05:04.512439558 +0000
++++ user/usys.pl	2026-10-19 17:14:49.309933713 +0000
+@@ -40,6 +40,7 @@
+ entry("dup");
+ entry("getpid");
+ entry("sbrk");
++entry("va2pa");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
+--- /dev/null	2026-10-19 17:02:10.261713691 +0000
++++ user/vatest.c	2026-10-19 17:31:10.050222006 +0000
+@@ -0,0 +1,56 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int global_value = 123;
++
++static void
++show_mapping(char *label, uint64 va)
++{
++  uint64 pa = va2pa(va);
++
++  if (pa == (uint64)-1)
++    printf("%s: va=%p pa=-1\n", label, (void*)va);
++  else
++    printf("%s: va=%p pa=%p\n", label, (void*)va, (void*)pa);
++}
++
++int
++main(void)
++{
++  int local_value = 456;
++  char *heap_value = malloc(4096);
++
++  if (heap_value == 0) {
++    printf("vatest: malloc failed\n");
++    exit(1);
++  }
++
++  printf("Q1: virtual-to-physical translation\n");
++  show_mapping("global", (uint64)&global_value);
++  show_mapping("local", (uint64)&local_value);
++  show_mapping("heap", (uint64)heap_value);
++  show_mapping("invalid", 0x7fffffff);
++
++  int pid = fork();
++  if (pid < 0) {
++    printf("vatest: fork failed\n");
++    free(heap_value);
++    exit(1);
++  }
++
++  if (pid == 0) {
++    printf("child pid=%d\n", getpid());
++    show_mapping("child global", (uint64)&global_value);
++    free(heap_value);
++    exit(0);
++  }
++
++  wait(0);
++  printf("parent pid=%d\n", getpid());
++  show_mapping("parent global", (uint64)&global_value);
++
++
++  free(heap_value);
++  exit(0);
++}
+

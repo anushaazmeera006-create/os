@@ -1,0 +1,260 @@
+--- xv6-clean/defs.h	2026-08-24 14:26:16.379799800 +0000
++++ asg10/q1-memtrack/defs.h	2026-11-03 10:29:59.613456000 +0000
+@@ -108,6 +108,20 @@
+ int             fork(void);
+ int             growproc(int);
+ int             kill(int);
++int             get_total_allocated(void);
++int             get_total_freed(void);
++int             ntotal_pages(void);
++int             nfree_pages(void);
++int             get_total_allocated(void);
++int             get_total_freed(void);
++int             ntotal_pages(void);
++int             nfree_pages(void);
++int             get_total_allocated(void);
++int             get_total_freed(void);
++int             ntotal_pages(void);
++int             nfree_pages(void);
++int             get_total_allocated(void);
++int             get_total_freed(void);
+ struct cpu*     mycpu(void);
+ struct proc*    myproc();
+ void            pinit(void);
+ --- xv6-clean/kalloc.c	2026-08-24 14:26:16.530683200 +0000
++++ asg10/q1-memtrack/kalloc.c	2026-11-03 10:34:29.372784900 +0000
+@@ -1,7 +1,3 @@
+-// Physical memory allocator, intended to allocate
+-// memory for user processes, kernel stacks, page table pages,
+-// and pipe buffers. Allocates 4096-byte pages.
+-
+ #include "types.h"
+ #include "defs.h"
+ #include "param.h"
+@@ -9,9 +5,9 @@
+ #include "mmu.h"
+ #include "spinlock.h"
+ 
++void kinit1(void *vstart, void *vend);
++void kinit2(void *vstart, void *vend);
+ void freerange(void *vstart, void *vend);
+-extern char end[]; // first address after kernel loaded from ELF file
+-                   // defined by the kernel linker script in kernel.ld
+ 
+ struct run {
+   struct run *next;
+@@ -23,11 +19,13 @@
+   struct run *freelist;
+ } kmem;
+ 
+-// Initialization happens in two phases.
+-// 1. main() calls kinit1() while still using entrypgdir to place just
+-// the pages mapped by entrypgdir on free list.
+-// 2. main() calls kinit2() with the rest of the physical pages
+-// after installing a full page table that maps them on all cores.
++static int total_allocated = 0;
++static int total_freed = 0;
++static int total_pages = 0;
++static int free_pages = 0;
++
++extern char end[];
++
+ void
+ kinit1(void *vstart, void *vend)
+ {
+@@ -48,49 +46,50 @@
+ {
+   char *p;
+   p = (char*)PGROUNDUP((uint)vstart);
+-  for(; p + PGSIZE <= (char*)vend; p += PGSIZE)
++  for(; p + PGSIZE <= (char*)vend; p += PGSIZE){
++    total_pages++;
+     kfree(p);
++  }
+ }
+-//PAGEBREAK: 21
+-// Free the page of physical memory pointed at by v,
+-// which normally should have been returned by a
+-// call to kalloc().  (The exception is when
+-// initializing the allocator; see kinit above.)
++
+ void
+ kfree(char *v)
+ {
+   struct run *r;
+-
+   if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
+     panic("kfree");
+-
+-  // Fill with junk to catch dangling refs.
+   memset(v, 1, PGSIZE);
+-
+   if(kmem.use_lock)
+     acquire(&kmem.lock);
+   r = (struct run*)v;
+   r->next = kmem.freelist;
+   kmem.freelist = r;
++  free_pages++;
++  total_freed++;
+   if(kmem.use_lock)
+     release(&kmem.lock);
+ }
+ 
+-// Allocate one 4096-byte page of physical memory.
+-// Returns a pointer that the kernel can use.
+-// Returns 0 if the memory cannot be allocated.
+ char*
+ kalloc(void)
+ {
+   struct run *r;
+-
+   if(kmem.use_lock)
+     acquire(&kmem.lock);
+   r = kmem.freelist;
+-  if(r)
++  if(r){
+     kmem.freelist = r->next;
++    free_pages--;
++    total_allocated++;
++  }
+   if(kmem.use_lock)
+     release(&kmem.lock);
++  if(r)
++    memset((char*)r, 1, PGSIZE);
+   return (char*)r;
+ }
+ 
++int get_total_allocated(void) { return total_allocated; }
++int get_total_freed(void) { return total_freed; }
++int ntotal_pages(void) { return total_pages; }
++int nfree_pages(void) { return free_pages; }
+--- xv6-clean/Makefile	2026-08-24 14:26:16.270868500 +0000
++++ asg10/q1-memtrack/Makefile	2026-11-03 10:02:20.000000000 +0000
+@@ -76,7 +76,7 @@
+ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+-CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32  -fno-omit-frame-pointer
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+@@ -157,7 +157,7 @@
+ 	$(OBJDUMP) -S _forktest > forktest.asm
+ 
+ mkfs: mkfs.c fs.h
+-	gcc -Werror -Wall -o mkfs mkfs.c
++	gcc  -Wall -o mkfs mkfs.c
+ 
+ # Prevent deletion of intermediate files, e.g. cat.o, after first build, so
+ # that disk image changes after first build are persistent until clean.  More
+@@ -181,6 +181,7 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_memtest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+--- xv6-clean/syscall.c	2026-08-24 14:26:16.837209800 +0000
++++ asg10/q1-memtrack/syscall.c	2026-11-03 10:02:12.853729400 +0000
+@@ -84,6 +84,7 @@
+ 
+ extern int sys_chdir(void);
+ extern int sys_close(void);
++extern int sys_memstats(void);
+ extern int sys_dup(void);
+ extern int sys_exec(void);
+ extern int sys_exit(void);
+@@ -126,6 +127,7 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_memstats]  sys_memstats,
+ };
+ 
+ void
+--- /dev/null	2026-11-03 09:58:59.254016748 +0000
++++ asg10/q1-memtrack/memtest.c	2026-11-03 10:02:19.989361200 +0000
+@@ -0,0 +1,32 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++int
++main(void)
++{
++  char *p;
++
++  printf(1, "=== Initial state ===\n");
++  memstats();
++
++  printf(1, "\nAllocating 8 pages via sbrk...\n");
++  p = sbrk(8 * 4096);
++  if(p == (char*)-1){ printf(1, "sbrk failed\n"); exit(); }
++  printf(1, "=== After sbrk(+8 pages) ===\n");
++  memstats();
++
++  printf(1, "\nReleasing 8 pages via sbrk(-8*4096)...\n");
++  if(sbrk(-8 * 4096) == (char*)-1){ printf(1, "sbrk shrink failed\n"); exit(); }
++  printf(1, "=== After sbrk(-8 pages) ===\n");
++  memstats();
++
++  printf(1, "\nAllocating 16 pages via sbrk...\n");
++  p = sbrk(16 * 4096);
++  if(p == (char*)-1){ printf(1, "sbrk failed\n"); exit(); }
++  printf(1, "=== After sbrk(+16 pages) ===\n");
++  memstats();
++
++  printf(1, "\nmemtest done\n");
++  exit();
++}
+--- xv6-clean/syscall.h	2026-08-24 14:26:16.843241600 +0000
++++ asg10/q1-memtrack/syscall.h	2026-11-03 10:02:12.721598400 +0000
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_memstats 22
+--- xv6-clean/sysproc.c	2026-08-24 14:26:16.859049500 +0000
++++ asg10/q1-memtrack/sysproc.c	2026-11-03 10:02:12.704104000 +0000
+@@ -89,3 +89,21 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_memstats(void)
++{
++  int total_pages = ntotal_pages();
++  int free_pages = nfree_pages();
++  int allocated = get_total_allocated();
++  int freed = get_total_freed();
++  int current = allocated - freed;
++  cprintf("== Memory Statistics ==\n");
++  cprintf("Total pages managed:    %d\n", total_pages);
++  cprintf("Currently free:         %d\n", free_pages);
++  cprintf("Total allocated (ever): %d\n", allocated);
++  cprintf("Total freed (ever):     %d\n", freed);
++  cprintf("Currently allocated:    %d (allocated - freed)\n", current);
++  cprintf("=======================\n");
++  return 0;
++}
+--- xv6-clean/user.h	2026-08-24 14:26:16.939492100 +0000
++++ asg10/q1-memtrack/user.h	2026-11-03 10:02:12.769117900 +0000
+@@ -23,6 +23,7 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int memstats(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+
+--- xv6-clean/usys.S	2026-08-24 14:26:16.961714700 +0000
++++ asg10/q1-memtrack/usys.S	2026-11-03 10:02:12.735657300 +0000
+@@ -29,3 +29,4 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(memstats)

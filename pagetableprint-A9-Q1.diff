@@ -1,0 +1,149 @@
+--- xv6-clean/defs.h	2026-08-24 14:26:16.379799800 +0000
++++ asg9/q1-ptprint/defs.h	2026-10-27 09:49:13.879123700 +0000
+@@ -108,6 +108,7 @@
+ int             fork(void);
+ int             growproc(int);
+ int             kill(int);
++void            vmprint(pde_t*);
+ struct cpu*     mycpu(void);
+ struct proc*    myproc();
+ void            pinit(void);
+--- xv6-clean/Makefile	2026-08-24 14:26:16.270868500 +0000
++++ asg9/q1-ptprint/Makefile	2026-10-27 09:49:31.000000000 +0000
+@@ -76,7 +76,7 @@
+ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+-CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32  -fno-omit-frame-pointer
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+@@ -157,7 +157,7 @@
+ 	$(OBJDUMP) -S _forktest > forktest.asm
+ 
+ mkfs: mkfs.c fs.h
+-	gcc -Werror -Wall -o mkfs mkfs.c
++	gcc  -Wall -o mkfs mkfs.c
+ 
+ # Prevent deletion of intermediate files, e.g. cat.o, after first build, so
+ # that disk image changes after first build are persistent until clean.  More
+@@ -181,6 +181,7 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_pttest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+--- /dev/null	2026-10-27 09:48:18.886015350 +0000
++++ asg9/q1-ptprint/pttest.c	2026-10-27 09:49:31.863981300 +0000
+@@ -0,0 +1,16 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++int
++main(void)
++{
++  printf(1, "=== vmprint at startup ===\n");
++  vmprint();
++
++  if(sbrk(4 * 4096) == (char*)-1){ printf(1, "sbrk failed\n"); exit(); }
++  printf(1, "=== after sbrk(4*4096) ===\n");
++  vmprint();
++
++  exit();
++}
+--- xv6-clean/syscall.c	2026-08-24 14:26:16.837209800 +0000
++++ asg9/q1-ptprint/syscall.c	2026-10-27 09:49:26.061805700 +0000
+@@ -84,6 +84,7 @@
+ 
+ extern int sys_chdir(void);
+ extern int sys_close(void);
++extern int sys_vmprint(void);
+ extern int sys_dup(void);
+ extern int sys_exec(void);
+ extern int sys_exit(void);
+@@ -126,6 +127,7 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_vmprint]    sys_vmprint,
+ };
+ 
+ void
+--- xv6-clean/syscall.h	2026-08-24 14:26:16.843241600 +0000
++++ asg9/q1-ptprint/syscall.h	2026-10-27 09:49:25.938771100 +0000
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_vmprint 22
+--- xv6-clean/sysproc.c	2026-08-24 14:26:16.859049500 +0000
++++ asg9/q1-ptprint/sysproc.c	2026-10-27 09:49:25.930422200 +0000
+@@ -89,3 +89,10 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_vmprint(void)
++{
++  vmprint(myproc()->pgdir);
++  return 0;
++}
+--- xv6-clean/user.h	2026-08-24 14:26:16.939492100 +0000
++++ asg9/q1-ptprint/user.h	2026-10-27 09:49:25.978199200 +0000
+@@ -23,6 +23,7 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int vmprint(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+--- xv6-clean/usys.S	2026-08-24 14:26:16.961714700 +0000
++++ asg9/q1-ptprint/usys.S	2026-10-27 09:49:25.953907800 +0000
+@@ -29,3 +29,4 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(vmprint)
+--- xv6-clean/vm.c	2026-08-24 14:26:16.976258900 +0000
++++ asg9/q1-ptprint/vm.c	2026-10-27 09:49:13.845987700 +0000
+@@ -392,3 +392,34 @@
+ //PAGEBREAK!
+ // Blank page.
+ 
++
++// Asg9 Q1: print page table of calling process (user pages only)
++void
++vmprint(pde_t *pgdir)
++{
++  int i, k, user_pages, pt_pages;
++  pte_t *pgtab;
++  uint va;
++  struct proc *cur = myproc();
++
++  user_pages = 0; pt_pages = 0;
++  cprintf("== page directory of pid %d ==\n", cur->pid);
++  for(i = 0; i < NPDENTRIES; i++){
++    if(!(pgdir[i] & PTE_P))
++      continue;
++    if((uint)(i << PDXSHIFT) >= KERNBASE)
++      continue;                              // skip kernel mappings
++    pt_pages++;                              // one page-table page per present PDE
++    pgtab = (pte_t*)P2V(PTE_ADDR(pgdir[i]));
++    for(k = 0; k < NPTENTRIES; k++){
++      if(!(pgtab[k] & PTE_P))
++        continue;
++      va = (i << PDXSHIFT) | (k << PTXSHIFT);
++      cprintf("  va=%x pa=%x flags P=%d W=%d U=%d\n",
++              va, PTE_ADDR(pgtab[k]),
++              1, (pgtab[k] & PTE_W) ? 1 : 0, (pgtab[k] & PTE_U) ? 1 : 0);
++      user_pages++;
++    }
++  }
++  cprintf("total user pages: %d, page-table pages: %d\n", user_pages, pt_pages);
++}

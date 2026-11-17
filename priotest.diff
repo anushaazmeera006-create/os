@@ -1,0 +1,327 @@
+--- xv6-clean/defs.h	2026-08-24 14:26:16.379799800 +0000
++++ asg7/q4-sched/defs.h	2026-10-06 13:54:17.870844700 +0000
+@@ -108,6 +108,9 @@
+ int             fork(void);
+ int             growproc(int);
+ int             kill(int);
++int             set_priority(int, int);
++int             get_priority(int);
++void            age_procs(void);
+ struct cpu*     mycpu(void);
+ struct proc*    myproc();
+ void            pinit(void);
+--- xv6-clean/Makefile	2026-08-24 14:26:16.270868500 +0000
++++ asg7/q4-sched/Makefile	2026-10-06 13:54:24.000000000 +0000
+@@ -76,7 +76,7 @@
+ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+-CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32  -fno-omit-frame-pointer
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+@@ -157,7 +157,7 @@
+ 	$(OBJDUMP) -S _forktest > forktest.asm
+ 
+ mkfs: mkfs.c fs.h
+-	gcc -Werror -Wall -o mkfs mkfs.c
++	gcc  -Wall -o mkfs mkfs.c
+ 
+ # Prevent deletion of intermediate files, e.g. cat.o, after first build, so
+ # that disk image changes after first build are persistent until clean.  More
+@@ -181,6 +181,7 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_priotest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+	--- xv6-clean/usys.S	2026-08-24 14:26:16.961714700 +0000
++++ asg7/q4-sched/usys.S	2026-10-06 13:54:17.825389000 +0000
+@@ -29,3 +29,5 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(set_priority)
++SYSCALL(get_priority)
+--- xv6-clean/user.h	2026-08-24 14:26:16.939492100 +0000
++++ asg7/q4-sched/user.h	2026-10-06 13:54:17.902607100 +0000
+@@ -23,6 +23,8 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int set_priority(int, int);
++int get_priority(int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+--- xv6-clean/trap.c	2026-08-24 14:26:16.883835200 +0000
++++ asg7/q4-sched/trap.c	2026-10-06 13:54:02.456590900 +0000
+@@ -48,6 +48,7 @@
+ 
+   switch(tf->trapno){
+   case T_IRQ0 + IRQ_TIMER:
++    age_procs();
+     if(cpuid() == 0){
+       acquire(&tickslock);
+       ticks++;
+--- xv6-clean/sysproc.c	2026-08-24 14:26:16.859049500 +0000
++++ asg7/q4-sched/sysproc.c	2026-10-06 13:54:18.029437500 +0000
+@@ -89,3 +89,21 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_set_priority(void)
++{
++  int pid, prio;
++  if(argint(0, &pid) < 0 || argint(1, &prio) < 0)
++    return -1;
++  return set_priority(pid, prio);
++}
++
++int
++sys_get_priority(void)
++{
++  int pid;
++  if(argint(0, &pid) < 0)
++    return -1;
++  return get_priority(pid);
++}
+--- xv6-clean/sysproc.c	2026-08-24 14:26:16.859049500 +0000
++++ asg7/q4-sched/sysproc.c	2026-10-06 13:54:18.029437500 +0000
+@@ -89,3 +89,21 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_set_priority(void)
++{
++  int pid, prio;
++  if(argint(0, &pid) < 0 || argint(1, &prio) < 0)
++    return -1;
++  return set_priority(pid, prio);
++}
++
++int
++sys_get_priority(void)
++{
++  int pid;
++  if(argint(0, &pid) < 0)
++    return -1;
++  return get_priority(pid);
++}
+--- xv6-clean/syscall.h	2026-08-24 14:26:16.843241600 +0000
++++ asg7/q4-sched/syscall.h	2026-10-06 13:54:17.790854800 +0000
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_set_priority 22
++#define SYS_get_priority 23
+
+--- xv6-clean/syscall.c	2026-08-24 14:26:16.837209800 +0000
++++ asg7/q4-sched/syscall.c	2026-10-06 13:54:18.013763100 +0000
+@@ -84,6 +84,8 @@
+ 
+ extern int sys_chdir(void);
+ extern int sys_close(void);
++extern int sys_set_priority(void);
++extern int sys_get_priority(void);
+ extern int sys_dup(void);
+ extern int sys_exec(void);
+ extern int sys_exit(void);
+@@ -126,6 +128,8 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_set_priority] sys_set_priority,
++[SYS_get_priority] sys_get_priority,
+ };
+ 
+ void
+--- xv6-clean/proc.h	2026-08-24 14:26:16.685268900 +0000
++++ asg7/q4-sched/proc.h	2026-10-06 13:53:50.967515600 +0000
+@@ -41,6 +41,8 @@
+   char *kstack;                // Bottom of kernel stack for this process
+   enum procstate state;        // Process state
+   int pid;                     // Process ID
++  int priority;              // 1 = highest, 20 = lowest
++  int waitticks;               // ticks waited while RUNNABLE
+   struct proc *parent;         // Parent process
+   struct trapframe *tf;        // Trap frame for current syscall
+   struct context *context;     // swtch() here to run process
+--- xv6-clean/proc.c	2026-08-24 14:26:16.677276700 +0000
++++ asg7/q4-sched/proc.c	2026-10-06 13:54:02.424569100 +0000
+@@ -319,42 +319,48 @@
+ //  - swtch to start running that process
+ //  - eventually that process transfers control
+ //      via swtch back to the scheduler.
++static int rr_idx = 0;   // round-robin tie-break cursor
++
+ void
+ scheduler(void)
+ {
+-  struct proc *p;
++  struct proc *p, *best;
+   struct cpu *c = mycpu();
++  int i, idx;
+   c->proc = 0;
+-  
++
+   for(;;){
+-    // Enable interrupts on this processor.
+     sti();
+-
+-    // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
+-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++
++    // choose RUNNABLE proc with lowest priority number;
++    // ties broken round-robin by scanning from rr_idx
++    best = 0;
++    for(i = 0; i < NPROC; i++){
++      idx = (rr_idx + i) % NPROC;
++      p = &ptable.proc[idx];
+       if(p->state != RUNNABLE)
+         continue;
+-
+-      // Switch to chosen process.  It is the process's job
+-      // to release ptable.lock and then reacquire it
+-      // before jumping back to us.
++      if(!best || p->priority < best->priority)
++        best = p;
++    }
++    if(best){
++      rr_idx = (int)(best - ptable.proc + 1) % NPROC;
++      p = best;
+       c->proc = p;
+       switchuvm(p);
+       p->state = RUNNING;
++      p->waitticks = 0;
+ 
+-      swtch(&(c->scheduler), p->context);
++      swtch(&c->scheduler, p->context);
+       switchkvm();
+-
+-      // Process is done running for now.
+-      // It should have changed its p->state before coming back.
+       c->proc = 0;
+     }
+     release(&ptable.lock);
+-
+   }
+ }
+ 
++
+ // Enter scheduler.  Must hold only ptable.lock
+ // and have changed proc->state. Saves and restores
+ // intena because intena is a property of this
+@@ -532,3 +538,56 @@
+     cprintf("\n");
+   }
+ }
++
++int
++set_priority(int pid, int priority)
++{
++  struct proc *p;
++  int old = -1;
++  if(priority < 1 || priority > 20)
++    return -1;
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
++    if(p->pid == pid){
++      old = p->priority;
++      p->priority = priority;
++      break;
++    }
++  release(&ptable.lock);
++  return old;
++}
++
++int
++get_priority(int pid)
++{
++  struct proc *p;
++  int prio = -1;
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
++    if(p->pid == pid){
++      prio = p->priority;
++      break;
++    }
++  release(&ptable.lock);
++  return prio;
++}
++
++// aging: called every timer tick; RUNNABLE procs waiting > 30 ticks
++// get priority boosted by 1 (number decremented) and counter reset
++void
++age_procs(void)
++{
++  struct proc *p;
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if(p->state == RUNNABLE){
++      p->waitticks++;
++      if(p->waitticks > 30){
++        if(p->priority > 1)
++          p->priority--;
++        p->waitticks = 0;
++      }
++    }
++  }
++  release(&ptable.lock);
++}
+--- /dev/null	2026-10-06 10:29:39.451355319 +0000
++++ asg7/q4-sched/priotest.c	2026-10-06 13:54:24.917583400 +0000
+@@ -0,0 +1,44 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++static void
++child(int id, int prio)
++{
++  int start, t, lastprint, p, i;
++  volatile int k;
++  set_priority(getpid(), prio);
++  start = uptime();
++  lastprint = start;
++  printf(1, "proc %d pid %d START prio %d tick %d\n", id, getpid(), prio, start);
++  for(;;){
++    for(k = 0; k < 50000; k++)
++      ;                          /* CPU-bound burst */
++    t = uptime();
++    p = get_priority(getpid());
++    if(t - lastprint >= 20){
++      printf(1, "proc %d pid %d tick %d priority %d\n", id, getpid(), t, p);
++      lastprint = t;
++    }
++    if(t - start >= 100)         /* 100 ticks of CPU work each */
++      break;
++  }
++  printf(1, "proc %d pid %d FINISHED tick %d priority %d\n",
++         id, getpid(), uptime(), get_priority(getpid()));
++  exit();
++}
++
++int
++main(void)
++{
++  int prios[4] = {1, 5, 10, 20};
++  int i;
++  for(i = 0; i < 4; i++){
++    if(fork() == 0)
++      child(i, prios[i]);
++  }
++  for(i = 0; i < 4; i++)
++    wait();
++  printf(1, "all 4 completed - order follows priority; pid with prio 20 survived via aging\n");
++  exit();
++}

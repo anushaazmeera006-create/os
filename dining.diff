@@ -1,0 +1,103 @@
+diff --git a/user/dining.c b/user/dining.c
+new file mode 100644
+index 0000000..4928b68
+--- /dev/null
++++ b/user/dining.c
+@@ -0,0 +1,91 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++#define NPHIL 5
++#define CYCLES 5
++
++void
++philosopher(int id, int forks[NPHIL])
++{
++  int left = id;
++  int right = (id + 1) % NPHIL;
++
++  // Always acquire the lower-numbered fork first.
++  int first = left < right ? left : right;
++  int second = left < right ? right : left;
++
++  for (int i = 0; i < CYCLES; i++) {
++
++    printf("Philosopher %d (PID %d): thinking\n",
++           id, getpid());
++
++    // Acquire forks in increasing order.
++    sem_wait(forks[first]);
++
++    printf("Philosopher %d: picked fork %d\n",
++           id, first);
++
++    sem_wait(forks[second]);
++
++    printf("Philosopher %d: picked fork %d\n",
++           id, second);
++
++    printf("Philosopher %d: eating (cycle %d)\n",
++           id, i + 1);
++
++    // Release both forks.
++    sem_signal(forks[second]);
++    sem_signal(forks[first]);
++
++    printf("Philosopher %d: finished eating\n", id);
++
++    // Small delay.
++    for (volatile int j = 0; j < 50000; j++)
++      ;
++  }
++
++  printf("Philosopher %d finished all cycles\n", id);
++}
++
++int
++main(void)
++{
++  int forks[NPHIL];
++  int pid;
++
++  // One binary semaphore for each fork.
++  for (int i = 0; i < NPHIL; i++) {
++    forks[i] = sem_init(1);
++
++    if (forks[i] < 0) {
++      printf("fork semaphore initialization failed\n");
++      exit(1);
++    }
++  }
++
++  // Create one process for each philosopher.
++  for (int i = 0; i < NPHIL; i++) {
++
++    pid = fork();
++
++    if (pid < 0) {
++      printf("fork failed\n");
++      exit(1);
++    }
++
++    if (pid == 0) {
++      philosopher(i, forks);
++      exit(0);
++    }
++  }
++
++  // Parent waits for all philosophers.
++  for (int i = 0; i < NPHIL; i++)
++    wait(0);
++
++  printf("Dining Philosophers test completed\n");
++  printf("All 5 philosophers completed without deadlock\n");
++
++  exit(0);
++}
+
+         $U/_prodcons\
++        $U/_readwrite\
++        $U/_dining\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)

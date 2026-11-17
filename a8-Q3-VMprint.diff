@@ -1,0 +1,141 @@
+--- /home/anushaazmeera/assignment/Q3/.q3_before/kernel_defs.h	2026-10-19 18:17:59.170350291 +0000
++++ kernel/defs.h	2026-10-19 18:27:50.766369667 +0000
+@@ -64,6 +64,8 @@
+ uint            freemem_count(void);
+ // Q2: Counts the page-table pages in a process page table.
+ uint            pagetable_page_count(pagetable_t);
++// Q3: Declares the page-table dump function.
++void            vmprint(pagetable_t);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+--- /home/anushaazmeera/assignment/Q3/.q3_before/kernel_syscall.c	2026-10-19 18:17:59.189677674 +0000
++++ kernel/syscall.c	2026-10-19 18:29:25.202433537 +0000
+@@ -106,6 +106,8 @@
+ extern uint64 sys_sync(void);
+ // Q2: Declares the memory-statistics system call handler.
+ extern uint64 sys_getmeminfo(void);
++// Q3: Declares the page-table dump syscall handler.
++extern uint64 sys_vmprint(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -136,6 +138,8 @@
+   [SYS_sync]    sys_sync,
+   // Q2: Connects the memory-statistics syscall number to its handler.
+   [SYS_getmeminfo] sys_getmeminfo,
++  // Q3: Connects the vmprint syscall number to its handler.
++  [SYS_vmprint] sys_vmprint,
+   // clang-format on
+ };
+ 
+--- /home/anushaazmeera/assignment/Q3/.q3_before/kernel_syscall.h	2026-10-19 18:17:59.183641226 +0000
++++ kernel/syscall.h	2026-10-19 18:28:38.609057219 +0000
+@@ -24,3 +24,5 @@
+ #define SYS_va2pa  23
+ // Q2: Assign the getmeminfo system call number.
+ #define SYS_getmeminfo 24
++// Q3: Assigns the vmprint system call number.
++#define SYS_vmprint 25
+--- /home/anushaazmeera/assignment/Q3/.q3_before/kernel_sysproc.c	2026-10-19 18:17:59.177625911 +0000
++++ kernel/sysproc.c	2026-10-19 18:28:12.500908783 +0000
+@@ -160,3 +160,10 @@
+ 
+   return 0;
+ }
++// Q3: Prints the calling process page table.
++uint64
++sys_vmprint(void)
++{
++  vmprint(myproc()->pagetable);
++  return 0;
++}
+--- /home/anushaazmeera/assignment/Q3/.q3_before/kernel_vm.c	2026-10-19 18:17:59.162827788 +0000
++++ kernel/vm.c	2026-10-19 18:26:48.680230914 +0000
+@@ -514,3 +514,55 @@
+ {
+   return countpagetable(pagetable, 2);
+ }
++// Q3: Walk a page table, printing user entries and counting kernel mappings.
++static void
++vmprint_walk(pagetable_t pagetable, int level, uint64 prefix,
++             int depth, uint *kernel_entries)
++{
++  for (int i = 0; i < 512; i++) {
++    pte_t pte = pagetable[i];
++
++    if ((pte & PTE_V) == 0)
++      continue;
++
++    uint64 va = prefix | ((uint64)i << (12 + 9 * level));
++    int leaf = (pte & (PTE_R | PTE_W | PTE_X)) != 0;
++
++    if (va >= KERNBASE) {
++      if (leaf)
++        (*kernel_entries)++;
++      else if (level > 0)
++        vmprint_walk((pagetable_t)PTE2PA(pte), level - 1, va,
++                     depth + 1, kernel_entries);
++      continue;
++    }
++
++    for (int j = 0; j < depth; j++)
++      printk("  ");
++
++    if (!leaf && level > 0) {
++      printk("L%d[%d] table_pa=%p P=%d W=%d U=%d\n",
++             level, i, (void*)PTE2PA(pte),
++             (pte & PTE_V) != 0, (pte & PTE_W) != 0,
++             (pte & PTE_U) != 0);
++      vmprint_walk((pagetable_t)PTE2PA(pte), level - 1, va,
++                   depth + 1, kernel_entries);
++    } else {
++      printk("L0[%d] va=%p pa=%p P=%d W=%d U=%d\n",
++             i, (void*)va, (void*)PTE2PA(pte),
++             (pte & PTE_V) != 0, (pte & PTE_W) != 0,
++             (pte & PTE_U) != 0);
++    }
++  }
++}
++
++// Q3: Print the calling process page table and kernel-entry count.
++void
++vmprint(pagetable_t pagetable)
++{
++  uint kernel_entries = 0;
++
++  printk("page table dump:\n");
++  vmprint_walk(pagetable, 2, 0, 0, &kernel_entries);
++  printk("kernel entries: %d\n", (int)kernel_entries);
++}
+--- /home/anushaazmeera/assignment/Q3/.q3_before/Makefile	2026-10-19 18:17:59.224227406 +0000
++++ Makefile	2026-10-19 18:31:45.241648144 +0000
+@@ -148,6 +148,7 @@
+ 	$U/_sync\
+ 	$U/_vatest\
+ 	$U/_memtest\
++	$U/_vmprinttest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+--- /home/anushaazmeera/assignment/Q3/.q3_before/user_user.h	2026-10-19 18:17:59.198235822 +0000
++++ user/user.h	2026-10-19 18:29:47.499319197 +0000
+@@ -27,6 +27,8 @@
+ int sync(void);
+ // Q2: Requests memory statistics for the calling process.
+ int getmeminfo(struct meminfo *);
++// Q3: Declares the user-callable page-table dump.
++int vmprint(void);
+ 
+ // ulib.c
+ int stat(const char *, struct stat *);
+--- /home/anushaazmeera/assignment/Q3/.q3_before/user_usys.pl	2026-10-19 18:17:59.207159168 +0000
++++ user/usys.pl	2026-10-19 18:30:14.486919879 +0000
+@@ -46,3 +46,5 @@
+ entry("sync");
+ # Q2: Generates the user-space stub for getmeminfo.
+ entry("getmeminfo");
++# Q3: Generates the user-space vmprint syscall stub.
++entry("vmprint");
+
+

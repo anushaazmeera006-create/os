@@ -1,0 +1,247 @@
+--- /dev/fd/63	2026-08-31 18:56:33.854708579 +0000
++++ Makefile	2026-08-31 18:52:38.856456400 +0000
+@@ -146,6 +146,7 @@
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
++        $U/_mlfqtest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+--- /dev/fd/63	2026-08-31 18:56:12.802710460 +0000
++++ kernel/proc.c	2026-08-31 18:51:03.543635696 +0000
+@@ -125,6 +125,8 @@
+   p->pid = allocpid();
+   p->state = USED;
+ 
++  p->queue_level = 0;
++  p->ticks_used = 0;
+   // Allocate a trapframe page.
+   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
+     freeproc(p);
+@@ -425,6 +427,7 @@
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
++
+ void
+ scheduler(void)
+ {
+@@ -432,40 +435,42 @@
+   struct cpu *c = mycpu();
+ 
+   c->proc = 0;
++
+   for (;;) {
+-    // The most recent process to run may have had interrupts
+-    // turned off; enable them to avoid a deadlock if all
+-    // processes are waiting. Then turn them back off
+-    // to avoid a possible race between an interrupt
+-    // and wfi.
+     intr_on();
+     intr_off();
+ 
+-    int found = 0;
+-    for (p = proc; p < &proc[NPROC]; p++) {
+-      acquire(&p->lock);
+-      if (p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Don't re-enable interrupts on release.
+-        mycpu()->intena = 0;
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
++    // Check queues from highest priority to lowest.
++    for (int level = 0; level < 3; level++) {
++
++      for (p = proc; p < &proc[NPROC]; p++) {
++        acquire(&p->lock);
++
++        if (p->state == RUNNABLE &&
++            p->queue_level == level) {
++
++          p->state = RUNNING;
++          c->proc = p;
++
++          swtch(&c->context, &p->context);
++
++          mycpu()->intena = 0;
++          c->proc = 0;
++
++          release(&p->lock);
++
++          // Restart from highest-priority queue.
++          goto next_round;
++        }
++
++        release(&p->lock);
+       }
+-      release(&p->lock);
+-    }
+-    if (found == 0) {
+-      // nothing to run; stop running on this core until an interrupt.
+-      asm volatile("wfi");
+     }
++
++    asm volatile("wfi");
++
++next_round:
++    ;
+   }
+ }
+ 
+@@ -503,6 +508,8 @@
+   struct proc *p = myproc();
+   acquire(&p->lock);
+   p->state = RUNNABLE;
++  p->ticks_used = 0;
++
+   sched();
+   release(&p->lock);
+ }
+ --- /dev/fd/63	2026-08-31 18:56:23.450710186 +0000
++++ kernel/trap.c	2026-08-31 18:43:47.910863971 +0000
+@@ -163,9 +163,16 @@
+   w_sstatus(sstatus);
+ }
+ 
++// ===== Lab 4 Q3: MLFQ Timer Handling =====
++// Queue 0 gets 1 tick, queue 1 gets 2 ticks,
++// and queue 2 gets 4 ticks.
+ void
+ clockintr()
+ {
++  struct proc *p = myproc();
++  int quantum;
++  int should_yield = 0;
++
+   if (cpuid() == 0) {
+     acquire(&tickslock);
+     ticks++;
+@@ -173,9 +180,38 @@
+     release(&tickslock);
+   }
+ 
+-  // ask for the next timer interrupt. this also clears
+-  // the interrupt request. 1000000 is about a tenth
+-  // of a second.
++  if (p != 0) {
++    acquire(&p->lock);
++
++    if (p->state == RUNNING) {
++      // Quantum = 2^queue_level:
++      // level 0 -> 1 tick
++      // level 1 -> 2 ticks
++      // level 2 -> 4 ticks
++      quantum = 1 << p->queue_level;
++
++      p->ticks_used++;
++
++      // Process used its complete time slice.
++      if (p->ticks_used >= quantum) {
++        p->ticks_used = 0;
++
++        // Demote CPU-bound processes.
++        if (p->queue_level < 2)
++          p->queue_level++;
++
++        should_yield = 1;
++      }
++    }
++
++    release(&p->lock);
++  }
++
++  // Give another process a chance to run.
++  if (should_yield)
++    yield();
++
++  // Ask for the next timer interrupt.
+   w_stimecmp(r_time() + 1000000);
+ }
+ 
+
+--- /dev/fd/63	2026-08-31 18:56:17.650710564 +0000
++++ kernel/proc.h	2026-08-31 18:46:52.085653398 +0000
+@@ -88,7 +88,8 @@
+   int killed;           // If non-zero, have been killed
+   int xstate;           // Exit status to be returned to parent's wait
+   int pid;              // Process ID
+-
++  int queue_level;      // MLFQ priority level: 0 = highest, 2 = lowest
++  int ticks_used;       // Ticks used in current time slice
+   // wait_lock must be held when using this:
+   struct proc *parent; // Parent process
+ 
+tets func
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+
+void
+cpu_bound(int id)
+{
+  printf("CPU-bound process %d started, PID %d\n", id, getpid());
+
+  while(1) {
+    // CPU-intensive work
+  }
+}
+
+void
+io_bound(int id)
+{
+  int i;
+
+  printf("I/O-bound process %d started, PID %d\n", id, getpid());
+
+  for(i = 0; i < 10; i++) {
+    printf("I/O process %d yielding, iteration %d\n", id, i);
+    pause(2);
+  }
+
+  printf("I/O-bound process %d finished\n", id);
+  exit(0);
+}
+
+int
+main(void)
+{
+  int pid;
+  int i;
+
+  printf("MLFQ Test Started\n");
+
+  // Create CPU-bound processes.
+  for(i = 0; i < 2; i++) {
+    pid = fork();
+
+    if(pid == 0) {
+      cpu_bound(i + 1);
+    }
+  }
+
+  // Create I/O-bound processes.
+  for(i = 0; i < 2; i++) {
+    pid = fork();
+
+    if(pid == 0) {
+      io_bound(i + 1);
+    }
+  }
+
+  // Parent waits for I/O-bound children.
+  for(i = 0; i < 2; i++)
+    wait(0);
+
+  printf("MLFQ Test Finished\n");
+  exit(0);
+}

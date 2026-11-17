@@ -1,0 +1,242 @@
+--- xv6-clean/defs.h	2026-08-24 14:26:16.379799800 +0000
++++ asg3_q3/defs.h	2026-11-14 08:58:09.883660700 +0000
+@@ -108,6 +108,7 @@
+ int             fork(void);
+ int             growproc(int);
+ int             kill(int);
++int             set_burst(int,int);
+ struct cpu*     mycpu(void);
+ struct proc*    myproc();
+ void            pinit(void);
+--- xv6-clean/Makefile	2026-08-24 14:26:16.270868500 +0000
++++ asg3_q3/Makefile	2026-11-14 08:58:18.280337100 +0000
+@@ -76,7 +76,7 @@
+ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+-CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32  -fno-omit-frame-pointer
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+@@ -157,7 +157,7 @@
+ 	$(OBJDUMP) -S _forktest > forktest.asm
+ 
+ mkfs: mkfs.c fs.h
+-	gcc -Werror -Wall -o mkfs mkfs.c
++	gcc  -Wall -o mkfs mkfs.c
+ 
+ # Prevent deletion of intermediate files, e.g. cat.o, after first build, so
+ # that disk image changes after first build are persistent until clean.  More
+@@ -180,7 +180,8 @@
+ 	_stressfs\
+ 	_usertests\
+ 	_wc\
+-	_zombie\
++	_zombie _sjftest\
++	_sjftest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+--- xv6-clean/proc.c	2026-08-24 14:26:16.677276700 +0000
++++ asg3_q3/proc.c	2026-11-14 08:57:52.153852500 +0000
+@@ -88,6 +88,7 @@
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
++  p->burst_time = 0;
+ 
+   release(&ptable.lock);
+ 
+@@ -323,35 +324,45 @@
+ scheduler(void)
+ {
+   struct proc *p;
++  struct proc *best;
+   struct cpu *c = mycpu();
+   c->proc = 0;
+-  
++
+   for(;;){
+-    // Enable interrupts on this processor.
+     sti();
+-
+-    // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
++
++    // SJF: Pick RUNNABLE process with smallest burst_time.
++    // burst_time == 0 means unset (lowest priority, scheduled last).
++    best = 0;
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+       if(p->state != RUNNABLE)
+         continue;
++      
++      int p_bt = p->burst_time;
++      if(p_bt <= 0) p_bt = 999999; // Treat unset as huge number
++      
++      if(best == 0){
++        best = p;
++      } else {
++        int best_bt = best->burst_time;
++        if(best_bt <= 0) best_bt = 999999;
++        
++        if(p_bt < best_bt)
++          best = p;
++      }
++    }
+ 
+-      // Switch to chosen process.  It is the process's job
+-      // to release ptable.lock and then reacquire it
+-      // before jumping back to us.
+-      c->proc = p;
+-      switchuvm(p);
+-      p->state = RUNNING;
+-
+-      swtch(&(c->scheduler), p->context);
++    if(best != 0){
++      c->proc = best;
++      switchuvm(best);
++      best->state = RUNNING;
++      swtch(&(c->scheduler), best->context);
+       switchkvm();
+-
+-      // Process is done running for now.
+-      // It should have changed its p->state before coming back.
+       c->proc = 0;
+     }
+-    release(&ptable.lock);
+ 
++    release(&ptable.lock);
+   }
+ }
+ 
+@@ -532,3 +543,21 @@
+     cprintf("\n");
+   }
+ }
++
++// Asg3 Q3: Set burst time for a process
++int
++set_burst(int pid, int bt)
++{
++  struct proc *p;
++  int found = 0;
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if(p->pid == pid){
++      p->burst_time = bt;
++      found = 1;
++      break;
++    }
++  }
++  release(&ptable.lock);
++  return found ? 0 : -1;
++}
+--- xv6-clean/proc.h	2026-08-24 14:26:16.685268900 +0000
++++ asg3_q3/proc.h	2026-11-14 08:57:52.153852500 +0000
+@@ -40,7 +40,8 @@
+   pde_t* pgdir;                // Page table
+   char *kstack;                // Bottom of kernel stack for this process
+   enum procstate state;        // Process state
+-  int pid;                     // Process ID
++  int pid;
++  int burst_time; // Asg3 Q3: estimated burst time (0=unset)                     // Process ID
+   struct proc *parent;         // Parent process
+   struct trapframe *tf;        // Trap frame for current syscall
+   struct context *context;     // swtch() here to run process
+--- /dev/null	2026-11-14 05:22:55.860081675 +0000
++++ asg3_q3/sjftest.c	2026-11-14 08:58:13.723832300 +0000
+@@ -0,0 +1,36 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++void
++work(int id, int bt)
++{
++  volatile int x = 0;
++  int i;
++  set_burst(getpid(), bt);
++  printf(1, "P%d (pid %d, burst %d) start\n", id, getpid(), bt);
++  // CPU-bound loop (duration independent of bt for testing)
++  for(i = 0; i < 50000000; i++) x++;
++  printf(1, "P%d (pid %d, burst %d) done\n", id, getpid(), bt);
++}
++
++int
++main(void)
++{
++  int i;
++  printf(1, "=== SJF Scheduler Test ===\n");
++  printf(1, "Forking 4 procs with burst times 40, 10, 30, 20\n\n");
++
++  if(fork() == 0){ work(1, 40); exit(); }
++  for(i=0;i<2000000;i++);
++  if(fork() == 0){ work(2, 10); exit(); }
++  for(i=0;i<2000000;i++);
++  if(fork() == 0){ work(3, 30); exit(); }
++  for(i=0;i<2000000;i++);
++  if(fork() == 0){ work(4, 20); exit(); }
++
++  wait(); wait(); wait(); wait();
++  printf(1, "\n=== Expected 'done' order: P2(10), P4(20), P3(30), P1(40) ===\n");
++  printf(1, "=== sjftest done ===\n");
++  exit();
++}
+--- xv6-clean/syscall.c	2026-08-24 14:26:16.837209800 +0000
++++ asg3_q3/syscall.c	2026-11-14 08:58:10.089783400 +0000
+@@ -84,6 +84,7 @@
+ 
+ extern int sys_chdir(void);
+ extern int sys_close(void);
++extern int sys_set_burst(void);
+ extern int sys_dup(void);
+ extern int sys_exec(void);
+ extern int sys_exit(void);
+@@ -126,6 +127,7 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_set_burst]   sys_set_burst,
+ };
+ 
+ void
+--- xv6-clean/syscall.h	2026-08-24 14:26:16.843241600 +0000
++++ asg3_q3/syscall.h	2026-11-14 08:58:09.930992000 +0000
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_set_burst 22
+--- xv6-clean/sysproc.c	2026-08-24 14:26:16.859049500 +0000
++++ asg3_q3/sysproc.c	2026-11-14 08:58:09.915144700 +0000
+@@ -89,3 +89,12 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_set_burst(void)
++{
++  int pid, bt;
++  if(argint(0, &pid) < 0) return -1;
++  if(argint(1, &bt) < 0) return -1;
++  return set_burst(pid, bt);
++}
+--- xv6-clean/user.h	2026-08-24 14:26:16.939492100 +0000
++++ asg3_q3/user.h	2026-11-14 08:58:09.978381500 +0000
+@@ -23,6 +23,7 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int set_burst(int,int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+--- xv6-clean/usys.S	2026-08-24 14:26:16.961714700 +0000
++++ asg3_q3/usys.S	2026-11-14 08:58:09.946764700 +0000
+@@ -29,3 +29,4 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(set_burst)

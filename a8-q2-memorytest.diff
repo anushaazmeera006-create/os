@@ -1,0 +1,299 @@
+--- /home/anushaazmeera/assignment/Q2/.q2_before/kernel_defs.h	2026-10-19 17:37:12.746372218 +0000
++++ kernel/defs.h	2026-10-19 18:02:51.920132663 +0000
+@@ -60,6 +60,10 @@
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++// Q2: Exposes the current free-page count to kernel code.
++uint            freemem_count(void);
++// Q2: Counts the page-table pages in a process page table.
++uint            pagetable_page_count(pagetable_t);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+--- /home/anushaazmeera/assignment/Q2/.q2_before/kernel_kalloc.c	2026-10-19 17:37:12.694763119 +0000
++++ kernel/kalloc.c	2026-10-19 17:59:22.937420530 +0000
+@@ -21,6 +21,8 @@
+ struct {
+   struct spinlock lock;
+   struct run *freelist;
++  // Q2: Tracks free physical pages while the allocator lock is held.
++  uint free_pages;
+ } kmem;
+ 
+ void
+@@ -59,6 +61,8 @@
+   acquire(&kmem.lock);
+   r->next = kmem.freelist;
+   kmem.freelist = r;
++  // Q2: Count the page returned to the free list.
++  kmem.free_pages++;
+   release(&kmem.lock);
+ }
+ 
+@@ -74,9 +78,24 @@
+   r = kmem.freelist;
+   if (r)
+     kmem.freelist = r->next;
++  // Q2: Count the page removed from the free list.
++  if (r)
++    kmem.free_pages--;
+   release(&kmem.lock);
+ 
+   if (r)
+     memset((char *)r, 5, PGSIZE); // fill with junk
+   return (void *)r;
+ }
++// Q2: Return the free-page count while holding the allocator lock.
++uint
++freemem_count(void)
++{
++  uint count;
++
++  acquire(&kmem.lock);
++  count = kmem.free_pages;
++  release(&kmem.lock);
++
++  return count;
++}
+--- /home/anushaazmeera/assignment/Q2/.q2_before/kernel_syscall.h	2026-10-19 17:37:12.768074837 +0000
++++ kernel/syscall.h	2026-10-19 18:04:05.155396538 +0000
+@@ -22,3 +22,5 @@
+ #define SYS_close  21
+ #define SYS_sync   22
+ #define SYS_va2pa  23
++// Q2: Assign the getmeminfo system call number.
++#define SYS_getmeminfo 24
+--- /home/anushaazmeera/assignment/Q2/.q2_before/kernel_defs.h	2026-10-19 17:37:12.746372218 +0000
++++ kernel/defs.h	2026-10-19 18:02:51.920132663 +0000
+@@ -60,6 +60,10 @@
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++// Q2: Exposes the current free-page count to kernel code.
++uint            freemem_count(void);
++// Q2: Counts the page-table pages in a process page table.
++uint            pagetable_page_count(pagetable_t);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+--- /home/anushaazmeera/assignment/Q2/.q2_before/kernel_sysproc.c	2026-10-19 17:37:12.737749746 +0000
++++ kernel/sysproc.c	2026-10-19 18:07:43.060622921 +0000
+@@ -139,3 +139,24 @@
+ 
+   return pa;
+ }
++// Q2: Copy memory statistics for the calling process to user space.
++uint64
++sys_getmeminfo(void)
++{
++  uint64 addr;
++  struct proc *p = myproc();
++  struct meminfo info;
++
++  argaddr(0, &addr);
++
++  info.total_pages = (PHYSTOP - KERNBASE) / PGSIZE;
++  info.free_pages = freemem_count();
++  info.user_pages = p->sz / PGSIZE;
++  info.page_table_pages = pagetable_page_count(p->pagetable);
++
++    // Q2: Copy statistics to a destination within the process address space.
++  if (copyout(p->pagetable, p->sz, addr, (char *)&info, sizeof(info)) < 0)
++    return (uint64)-1;
++
++  return 0;
++}
+--- /home/anushaazmeera/assignment/Q2/.q2_before/kernel_types.h	2026-10-19 18:15:34.199050638 +0000
++++ kernel/types.h	2026-10-19 18:02:22.681178955 +0000
+@@ -8,3 +8,10 @@
+ typedef unsigned long uint64;
+ 
+ typedef uint64 pde_t;
++// Q2: Holds physical-memory and calling-process page statistics.
++struct meminfo {
++  uint total_pages;
++  uint free_pages;
++  uint user_pages;
++  uint page_table_pages;
++};
+--- /home/anushaazmeera/assignment/Q2/.q2_before/kernel_vm.c	2026-10-19 18:15:34.175050642 +0000
++++ kernel/vm.c	2026-10-19 18:02:06.320362864 +0000
+@@ -489,3 +489,28 @@
+   }
+   return 0;
+ }
++// Q2: Count this page table and its valid child page tables.
++static uint
++countpagetable(pagetable_t pagetable, int level)
++{
++  uint count = 1;
++
++  if (level == 0)
++    return count;
++
++  for (int i = 0; i < 512; i++) {
++    pte_t pte = pagetable[i];
++
++    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0)
++      count += countpagetable((pagetable_t)PTE2PA(pte), level - 1);
++  }
++
++  return count;
++}
++
++// Q2: Return the number of page-table pages used by a process.
++uint
++pagetable_page_count(pagetable_t pagetable)
++{
++  return countpagetable(pagetable, 2);
++}
+--- /home/anushaazmeera/assignment/Q2/.q2_before/Makefile	2026-10-19 17:37:12.800299931 +0000
++++ Makefile	2026-10-19 18:09:58.319834902 +0000
+@@ -147,6 +147,7 @@
+ 	$U/_dorphan\
+ 	$U/_sync\
+ 	$U/_vatest\
++	$U/_memtest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+--- /dev/null	2026-10-19 17:02:10.261713691 +0000
++++ user/memtest.c	2026-10-19 18:14:23.631062597 +0000
+@@ -0,0 +1,52 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++// Q2: Prints memory statistics for the calling process.
++static void
++printmem(char *label)
++{
++  struct meminfo info;
++
++  if (getmeminfo(&info) < 0) {
++    printf("memtest: getmeminfo failed\n");
++    exit(1);
++  }
++
++  printf("%s: total=%d free=%d user=%d page_tables=%d\n",
++         label, (int)info.total_pages, (int)info.free_pages,
++         (int)info.user_pages, (int)info.page_table_pages);
++}
++
++// Q2: Shows memory use before and after allocation and fork.
++int
++main(void)
++{
++  printf("Q2: physical memory statistics\n");
++  printmem("before sbrk");
++
++  if (sbrk(4 * 4096) == (char *)-1) {
++    printf("memtest: sbrk failed\n");
++    exit(1);
++  }
++  printmem("after sbrk");
++
++  int pid = fork();
++  if (pid < 0) {
++    printf("memtest: fork failed\n");
++    exit(1);
++  }
++
++  if (pid == 0) {
++    // Q2: Let the child pause while the parent checks memory use.
++    pause(20);
++    exit(0);
++  }
++
++  printmem("parent while child exists");
++  wait(0);
++  printmem("parent after child reaped");
++
++  exit(0);
++}
++
+--- /home/anushaazmeera/assignment/Q2/.q2_before/user_user.h	2026-10-19 17:37:12.784963460 +0000
++++ user/user.h	2026-10-19 18:06:13.028651350 +0000
+@@ -25,6 +25,8 @@
+ int pause(int);
+ int uptime(void);
+ int sync(void);
++// Q2: Requests memory statistics for the calling process.
++int getmeminfo(struct meminfo *);
+ 
+ // ulib.c--- /home/anushaazmeera/assignment/Q2/.q2_before/kernel_syscall.c	2026-10-19 17:37:12.778763602 +0000
++++ kernel/syscall.c	2026-10-19 18:05:43.672042837 +0000
+@@ -104,6 +104,8 @@
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
++// Q2: Declares the memory-statistics system call handler.
++extern uint64 sys_getmeminfo(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -132,6 +134,8 @@
+   [SYS_mkdir]   sys_mkdir,
+   [SYS_close]   sys_close,
+   [SYS_sync]    sys_sync,
++  // Q2: Connects the memory-statistics syscall number to its handler.
++  [SYS_getmeminfo] sys_getmeminfo,
+   // clang-format on
+ };
+ 
+--- /home/anushaazmeera/assignment/Q2/.q2_before/user_usys.pl	2026-10-19 17:37:12.790630319 +0000
++++ user/usys.pl	2026-10-19 18:06:40.766324919 +0000
+@@ -44,3 +44,5 @@
+ entry("pause");
+ entry("uptime");
+ entry("sync");
++# Q2: Generates the user-space stub for getmeminfo.
++entry("getmeminfo");
+--- /home/anushaazmeera/assignment/Q2/.q2_before/kernel_kalloc.c	2026-10-19 17:37:12.694763119 +0000
++++ kernel/kalloc.c	2026-10-19 17:59:22.937420530 +0000
+@@ -21,6 +21,8 @@
+ struct {
+   struct spinlock lock;
+   struct run *freelist;
++  // Q2: Tracks free physical pages while the allocator lock is held.
++  uint free_pages;
+ } kmem;
+ 
+ void
+@@ -59,6 +61,8 @@
+   acquire(&kmem.lock);
+   r->next = kmem.freelist;
+   kmem.freelist = r;
++  // Q2: Count the page returned to the free list.
++  kmem.free_pages++;
+   release(&kmem.lock);
+ }
+ 
+@@ -74,9 +78,24 @@
+   r = kmem.freelist;
+   if (r)
+     kmem.freelist = r->next;
++  // Q2: Count the page removed from the free list.
++  if (r)
++    kmem.free_pages--;
+   release(&kmem.lock);
+ 
+   if (r)
+     memset((char *)r, 5, PGSIZE); // fill with junk
+   return (void *)r;
+ }
++// Q2: Return the free-page count while holding the allocator lock.
++uint
++freemem_count(void)
++{
++  uint count;
++
++  acquire(&kmem.lock);
++  count = kmem.free_pages;
++  release(&kmem.lock);
++
++  return count;
++}
+
+ int stat(const char *, struct stat *);

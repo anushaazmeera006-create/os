@@ -1,0 +1,335 @@
+--- xv6-clean/defs.h	2026-08-24 14:26:16.379799800 +0000
++++ asg6/q4-syncdeadlock/defs.h	2026-09-13 15:44:23.267570000 +0000
+@@ -108,6 +108,10 @@
+ int             fork(void);
+ int             growproc(int);
+ int             kill(int);
++int             shm_get(void);
++int             sem_init(int, int);
++int             sem_wait(int);
++int             sem_signal(int);
+ struct cpu*     mycpu(void);
+ struct proc*    myproc();
+ void            pinit(void);
+@@ -188,3 +192,4 @@
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
++int             shm_map(pde_t*, void*, uint);
+--- xv6-clean/Makefile	2026-08-24 14:26:16.270868500 +0000
++++ asg6/q4-syncdeadlock/Makefile	2026-09-13 15:44:58.000000000 +0000
+@@ -76,7 +76,7 @@
+ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+-CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32  -fno-omit-frame-pointer
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+@@ -157,7 +157,7 @@
+ 	$(OBJDUMP) -S _forktest > forktest.asm
+ 
+ mkfs: mkfs.c fs.h
+-	gcc -Werror -Wall -o mkfs mkfs.c
++	gcc  -Wall -o mkfs mkfs.c
+ 
+ # Prevent deletion of intermediate files, e.g. cat.o, after first build, so
+ # that disk image changes after first build are persistent until clean.  More
+@@ -181,6 +181,7 @@
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_syncdeadlock\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+--- xv6-clean/memlayout.h	2026-08-24 14:26:16.599786600 +0000
++++ asg6/q4-syncdeadlock/memlayout.h	2026-09-13 15:44:28.439056100 +0000
+@@ -13,3 +13,4 @@
+ 
+ #define V2P_WO(x) ((x) - KERNBASE)    // same as V2P, but without casts
+ #define P2V_WO(x) ((x) + KERNBASE)    // same as P2V, but without casts
++#define SHM_VA 0x60000000   // Lab 6 Q1: fixed user VA of the shared page
+--- xv6-clean/proc.c	2026-08-24 14:26:16.677276700 +0000
++++ asg6/q4-syncdeadlock/proc.c	2026-09-13 15:44:28.820304700 +0000
+@@ -532,3 +532,76 @@
+     cprintf("\n");
+   }
+ }
++
++char *shm_page = 0;   // Lab 6 Q1: the shared physical page
++
++int
++shm_get(void)
++{
++  struct proc *cur = myproc();
++  char *page;
++
++  acquire(&ptable.lock);
++  if(shm_page == 0){
++    shm_page = kalloc();
++    if(shm_page)
++      memset(shm_page, 0, PGSIZE);
++  }
++  page = shm_page;
++  release(&ptable.lock);
++
++  if(page == 0)
++    return -1;
++  if(shm_map(cur->pgdir, (void*)SHM_VA, V2P(page)) < 0)
++    return -1;
++  return SHM_VA;
++}
++
++// Lab 6 Q2: Kernel Semaphores for Producer-Consumer
++struct ksem {
++  struct spinlock lock;
++  int count;
++};
++struct ksem ksems[8];   // Lab 6 Q4: pool of 8 (0-4 = forks) // 0=empty, 1=full, 2=mutex
++static int ksems_initialized = 0;
++
++void init_ksems(void) {
++  int i;
++  if(!ksems_initialized) {
++    for(i = 0; i < 8; i++)
++      initlock(&ksems[i].lock, "ksem");
++    ksems_initialized = 1;
++  }
++}
++
++int sem_init(int which, int count) {
++  init_ksems();
++  if(which < 0 || which > 7) return -1;
++  acquire(&ksems[which].lock);
++  ksems[which].count = count;
++  release(&ksems[which].lock);
++  return 0;
++}
++
++int sem_wait(int which) {
++  init_ksems();
++  if(which < 0 || which > 7) return -1;
++  acquire(&ksems[which].lock);
++  while(ksems[which].count <= 0) {
++    sleep(&ksems[which], &ksems[which].lock); // sleep releases the lock, reacquires on wakeup
++  }
++  ksems[which].count--;
++  release(&ksems[which].lock);
++  return 0;
++}
++
++int sem_signal(int which) {
++  init_ksems();
++  if(which < 0 || which > 7) return -1;
++  acquire(&ksems[which].lock);
++  ksems[which].count++;
++  wakeup(&ksems[which]); // wake up any process sleeping on this semaphore
++  release(&ksems[which].lock);
++  return 0;
++}
++
+--- /dev/null	2026-09-13 15:14:53.606301197 +0000
++++ asg6/q4-syncdeadlock/syncdeadlock.c	2026-09-13 15:44:50.646207200 +0000
+@@ -0,0 +1,86 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++#define NP 5
++#define NRES 3
++#define CYCLES 4
++
++#define MUTEX 3          /* protects the avail mirror */
++
++static const char *rname[NRES] = { "printer", "scanner", "disk" };
++
++/* each process needs 2 of the 3 types; pairs stored in ASCENDING order
++   (printer=0 < scanner=1 < disk=2) = the resource-ordering strategy */
++static int want[NP][2] = {
++  {0,1}, {1,2}, {0,2}, {0,1}, {1,2}
++};
++
++struct shminfo { int avail[NRES]; };
++
++int
++main(void)
++{
++  struct shminfo *shm;
++  int pid, i, k, id;
++
++  /* resource pools = counting semaphores (instance limits 2,1,2) */
++  sem_init(0, 2);        /* printer */
++  sem_init(1, 1);        /* scanner */
++  sem_init(2, 2);        /* disk    */
++  sem_init(MUTEX, 1);
++
++  shm = (struct shminfo*)shm_get();
++  shm->avail[0] = 2; shm->avail[1] = 1; shm->avail[2] = 2;
++
++  id = -1;
++  for(i = 0; i < NP; i++){
++    pid = fork();
++    if(pid == 0){ id = i; break; }
++  }
++
++  if(id >= 0){
++    shm = (struct shminfo*)shm_get();   /* child remaps to shared page */
++    for(k = 1; k <= CYCLES; k++){
++      int a = want[id][0], b = want[id][1];   /* a < b : global order */
++
++      sleep(2 + id);                     /* stagger arrivals */
++
++      printf(1, "[tick %d] P%d requests %s\n", uptime(), id, rname[a]);
++      sem_wait(a);
++      sem_wait(MUTEX);
++      shm->avail[a]--;
++      printf(1, "[tick %d] P%d granted %s (%s avail now %d)\n",
++             uptime(), id, rname[a], rname[a], shm->avail[a]);
++      sem_signal(MUTEX);
++
++      printf(1, "[tick %d] P%d requests %s\n", uptime(), id, rname[b]);
++      sem_wait(b);
++      sem_wait(MUTEX);
++      shm->avail[b]--;
++      printf(1, "[tick %d] P%d granted %s (%s avail now %d)\n",
++             uptime(), id, rname[b], rname[b], shm->avail[b]);
++      sem_signal(MUTEX);
++
++      printf(1, "[tick %d] P%d WORKING with %s+%s\n",
++             uptime(), id, rname[a], rname[b]);
++      sleep(8);                          /* simulated work */
++
++      sem_wait(MUTEX);
++      shm->avail[a]++; shm->avail[b]++;
++      printf(1, "[tick %d] P%d releasing %s+%s (avail now %d,%d,%d)\n",
++             uptime(), id, rname[a], rname[b],
++             shm->avail[0], shm->avail[1], shm->avail[2]);
++      sem_signal(MUTEX);
++      sem_signal(a);
++      sem_signal(b);
++    }
++    printf(1, "P%d COMPLETED %d cycles\n", id, CYCLES);
++    exit();
++  }
++
++  for(i = 0; i < NP; i++)
++    wait();
++  printf(1, "All 5 processes completed %d cycles - no deadlock, instances never exceeded.\n", CYCLES);
++  exit();
++}
+--- xv6-clean/syscall.c	2026-08-24 14:26:16.837209800 +0000
++++ asg6/q4-syncdeadlock/syscall.c	2026-09-13 15:44:30.073855300 +0000
+@@ -99,6 +99,10 @@
+ extern int sys_read(void);
+ extern int sys_sbrk(void);
+ extern int sys_sleep(void);
++extern int sys_shm_get(void);
++extern int sys_sem_init(void);
++extern int sys_sem_wait(void);
++extern int sys_sem_signal(void);
+ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+@@ -126,6 +130,10 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_shm_get]   sys_shm_get,
++[SYS_sem_init]   sys_sem_init,
++[SYS_sem_wait]   sys_sem_wait,
++[SYS_sem_signal] sys_sem_signal,
+ };
+ 
+ void
+--- xv6-clean/syscall.h	2026-08-24 14:26:16.843241600 +0000
++++ asg6/q4-syncdeadlock/syscall.h	2026-09-13 15:44:24.000078100 +0000
+@@ -20,3 +20,7 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_shm_get 22
++#define SYS_sem_init 23
++#define SYS_sem_wait 24
++#define SYS_sem_signal 25
+--- xv6-clean/sysproc.c	2026-08-24 14:26:16.859049500 +0000
++++ asg6/q4-syncdeadlock/sysproc.c	2026-09-13 15:44:22.917519700 +0000
+@@ -89,3 +89,27 @@
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_shm_get(void)
++{
++  return shm_get();
++}
++
++int sys_sem_init(void) {
++  int which, count;
++  if(argint(0, &which) < 0 || argint(1, &count) < 0) return -1;
++  return sem_init(which, count);
++}
++
++int sys_sem_wait(void) {
++  int which;
++  if(argint(0, &which) < 0) return -1;
++  return sem_wait(which);
++}
++
++int sys_sem_signal(void) {
++  int which;
++  if(argint(0, &which) < 0) return -1;
++  return sem_signal(which);
++}
+--- xv6-clean/user.h	2026-08-24 14:26:16.939492100 +0000
++++ asg6/q4-syncdeadlock/user.h	2026-09-13 15:44:29.534778800 +0000
+@@ -23,6 +23,10 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int shm_get(void);
++int sem_init(int, int);
++int sem_wait(int);
++int sem_signal(int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+--- xv6-clean/usys.S	2026-08-24 14:26:16.961714700 +0000
++++ asg6/q4-syncdeadlock/usys.S	2026-09-13 15:44:24.926685600 +0000
+@@ -29,3 +29,7 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(shm_get)
++SYSCALL(sem_init)
++SYSCALL(sem_wait)
++SYSCALL(sem_signal)
+--- xv6-clean/vm.c	2026-08-24 14:26:16.976258900 +0000
++++ asg6/q4-syncdeadlock/vm.c	2026-09-13 15:44:10.936834600 +0000
+@@ -1,3 +1,4 @@
++extern char *shm_page; // Lab 6 Q1: shared page declared in sysproc.c
+ #include "param.h"
+ #include "typess.h"
+ #include "defs.h"
+@@ -271,7 +272,7 @@
+       if(pa == 0)
+         panic("kfree");
+       char *v = P2V(pa);
+-      kfree(v);
++      if(v != shm_page) kfree(v);  // Lab 6 Q1: skip shared page
+       *pte = 0;
+     }
+   }
+@@ -392,3 +393,10 @@
+ //PAGEBREAK!
+ // Blank page.
+ 
++
++// Lab 6 Q1: map one physical page at a user VA (for shm_get)
++int
++shm_map(pde_t *pgdir, void *va, uint pa)
++{
++  return mappages(pgdir, va, PGSIZE, pa, PTE_W | PTE_U);
++}

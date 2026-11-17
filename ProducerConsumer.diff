@@ -1,0 +1,596 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 0ae6896..6ff6151 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -170,6 +170,7 @@ int             copyin(pagetable_t, uint64, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, uint64, char *, uint64, uint64);
+ int             ismapped(pagetable_t, uint64);
+ uint64          vmfault(pagetable_t, uint64, uint64, int);
++int             mappages(pagetable_t, uint64, uint64, uint64, int);
+ 
+ // plic.c
+ void            plicinit(void);
+@@ -184,3 +185,7 @@ void            virtio_disk_intr(void);
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x) / sizeof((x)[0]))
++void            seminit(void);
++int             sem_create(int);
++int             sem_wait(int);
++int             sem_signal(int);
+diff --git a/kernel/main.c b/kernel/main.c
+index df58e32..d4ea2dc 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -20,6 +20,7 @@ main()
+     kvminit();          // create kernel page table
+     kvminithart();      // turn on paging
+     procinit();         // process table
++    seminit();
+     trapinit();         // trap vectors
+     trapinithart();     // install kernel trap vector
+     plicinit();         // set up interrupt controller
+diff --git a/kernel/proc.c b/kernel/proc.c
+index f4c1668..b44c542 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,6 +5,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "semaphore.h"
+ 
+ struct cpu cpus[NCPU];
+ 
+@@ -124,7 +125,8 @@ allocproc(void)
+ found:
+   p->pid = allocpid();
+   p->state = USED;
+-
++  p->shm = 0;
++  p->shm_pa = 0;
+   // Allocate a trapframe page.
+   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
+     freeproc(p);
+@@ -165,6 +167,8 @@ freeproc(struct proc *p)
+   p->pid = 0;
+   p->name[0] = 0;
+   p->chan = 0;
++  p->shm = 0;
++  p->shm_pa = 0;
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
+@@ -211,6 +215,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
+ {
+   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+   uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  uvmunmap(pagetable, SHMBASE, 1, 0);
+   uvmfree(pagetable, sz);
+ }
+ 
+@@ -274,6 +279,17 @@ kfork(void)
+     return -1;
+   }
+   np->sz = p->sz;
++    if (p->shm != 0) {
++    if (mappages(np->pagetable, p->shm, PGSIZE, p->shm_pa,
++                 PTE_R | PTE_W | PTE_U) != 0) {
++      freeproc(np);
++      release(&np->lock);
++      return -1;
++    }
++
++    np->shm = p->shm;
++    np->shm_pa = p->shm_pa;
++  }
+ 
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+@@ -699,3 +715,84 @@ procdump(void)
+     printk("\n");
+   }
+ }
++struct {
++  struct spinlock lock;
++  struct semaphore sem[NSEM];
++} semtable;
++
++void
++seminit(void)
++{
++  initlock(&semtable.lock, "semtable");
++
++  for (int i = 0; i < NSEM; i++) {
++    semtable.sem[i].used = 0;
++    semtable.sem[i].value = 0;
++  }
++}
++
++int
++sem_create(int value)
++{
++  if (value < 0)
++    return -1;
++
++  acquire(&semtable.lock);
++
++  for (int i = 0; i < NSEM; i++) {
++    if (!semtable.sem[i].used) {
++      semtable.sem[i].used = 1;
++      semtable.sem[i].value = value;
++      release(&semtable.lock);
++      return i;
++    }
++  }
++
++  release(&semtable.lock);
++  return -1;
++}
++
++int
++sem_wait(int id)
++{
++  if (id < 0 || id >= NSEM)
++    return -1;
++
++  acquire(&semtable.lock);
++
++  if (!semtable.sem[id].used) {
++    release(&semtable.lock);
++    return -1;
++  }
++
++  while (semtable.sem[id].value == 0) {
++   release(&semtable.lock);
++   sleep();
++   acquire(&semtable.lock);
++  }
++
++  semtable.sem[id].value--;
++
++  release(&semtable.lock);
++  return 0;
++}
++
++int
++sem_signal(int id)
++{
++  if (id < 0 || id >= NSEM)
++    return -1;
++
++  acquire(&semtable.lock);
++
++  if (!semtable.sem[id].used) {
++    release(&semtable.lock);
++    return -1;
++  }
++
++  semtable.sem[id].value++;
++  wakeup(&semtable.sem[id]);
++
++  release(&semtable.lock);
++  return 0;
++}
+diff --git a/kernel/semaphore.h b/kernel/semaphore.h
+new file mode 100644
+index 0000000..376f6e1
+--- /dev/null
++++ b/kernel/semaphore.h
+@@ -0,0 +1,11 @@
++#define NSEM 16
++
++struct semaphore {
++  int used;
++  int value;
++};
++
++void seminit(void);
++int sem_create(int value);
++int sem_wait(int id);
++int sem_signal(int id);
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1800f20..e35dcb9 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -103,6 +103,10 @@ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
++extern uint64 sys_shm_get(void);
++extern uint64 sys_sem_init(void);
++extern uint64 sys_sem_wait(void);
++extern uint64 sys_sem_signal(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -130,6 +134,11 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_mkdir]   = sys_mkdir,
+   [SYS_close]   = sys_close,
+   [SYS_sync]    = sys_sync,
++  [SYS_shm_get] = sys_shm_get,
++  [SYS_sem_init]   = sys_sem_init,
++  [SYS_sem_wait]   = sys_sem_wait,
++  [SYS_sem_signal] = sys_sem_signal,
++
+   // clang-format on
+ };
+ diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 5a4a39f..2c85695 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -21,3 +21,7 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_sync   22
++#define SYS_shm_get  23
++#define SYS_sem_init    24
++#define SYS_sem_wait    25
++#define SYS_sem_signal  26
+
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index cd25557..c0a3ae8 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -110,3 +110,59 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++uint64
++sys_shm_get(void)
++{
++  struct proc *p = myproc();
++
++  if (p->shm != 0)
++    return p->shm;
++
++  char *mem = kalloc();
++  if (mem == 0)
++    return 0;
++
++  memset(mem, 0, PGSIZE);
++
++  uint64 pa = (uint64)mem;
++
++  if (mappages(p->pagetable, SHMBASE, PGSIZE, pa,
++               PTE_R | PTE_W | PTE_U) != 0) {
++    kfree(mem);
++    return 0;
++  }
++
++  p->shm = SHMBASE;
++  p->shm_pa = pa;
++
++  return p->shm;
++}
++uint64
++sys_sem_init(void)
++{
++  int value;
++
++  argint(0, &value);
++
++  return sem_create(value);
++}
++
++uint64
++sys_sem_wait(void)
++{
++  int id;
++
++  argint(0, &id);
++
++  return sem_wait(id);
++}
++
++uint64
++sys_sem_signal(void)
++{
++  int id;
++
++  argint(0, &id);
++
++  return sem_signal(id);
++}
+diff --git a/Makefile b/Makefile
+index af1e7a5..91bdd6f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -28,7 +28,8 @@ OBJS = \
+   $K/sysfile.o \
+   $K/kernelvec.o \
+   $K/plic.o \
+-  $K/virtio_disk.o
++  $K/virtio_disk.o \
++   
+ 
+ # riscv64-unknown-elf- or riscv64-linux-gnu-
+ # perhaps in /opt/riscv/bin
+@@ -150,6 +151,9 @@ UPROGS=\
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
++        $U/_peterson\
++        $U/_peterson\
++        $U/_prodcons\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/user/prodcons.c b/user/prodcons.c
+new file mode 100644
+index 0000000..f23d6e0
+--- /dev/null
++++ b/user/prodcons.c
+@@ -0,0 +1,117 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++#define BUF_SIZE 5
++#define ITEMS 20
++
++struct shared_buffer {
++  int buffer[BUF_SIZE];
++  int in;
++  int out;
++  int count;
++};
++
++void
++producer(struct shared_buffer *s, int empty, int full, int mutex)
++{
++  for (int item = 1; item <= ITEMS; item++) {
++
++    if (s->count == BUF_SIZE)
++      printf("Producer: buffer full, waiting...\n");
++
++    sem_wait(empty);
++    sem_wait(mutex);
++
++    s->buffer[s->in] = item;
++    s->in = (s->in + 1) % BUF_SIZE;
++    s->count++;
++
++    printf("Producer: produced %d (count=%d)\n",
++           item, s->count);
++
++    sem_signal(mutex);
++    sem_signal(full);
++
++  }
++
++  printf("Producer: finished\n");
++}
++
++void
++consumer(struct shared_buffer *s, int empty, int full, int mutex)
++{
++  for (int i = 1; i <= ITEMS; i++) {
++
++    if (s->count == 0)
++      printf("Consumer: buffer empty, waiting...\n");
++
++    sem_wait(full);
++    sem_wait(mutex);
++
++    int item = s->buffer[s->out];
++
++    s->out = (s->out + 1) % BUF_SIZE;
++    s->count--;
++
++    printf("Consumer: consumed %d (count=%d)\n",
++           item, s->count);
++
++    sem_signal(mutex);
++    sem_signal(empty);
++
++  }
++
++  printf("Consumer: finished\n");
++}
++
++int
++main(void)
++{
++  struct shared_buffer *s;
++  uint64 addr;
++  int empty, full, mutex;
++  int pid;
++
++  addr = shm_get();
++
++  if (addr == 0) {
++    printf("shm_get failed\n");
++    exit(1);
++  }
++
++  s = (struct shared_buffer *)addr;
++
++  s->in = 0;
++  s->out = 0;
++  s->count = 0;
++
++  empty = sem_init(BUF_SIZE);
++  full = sem_init(0);
++  mutex = sem_init(1);
++
++  if (empty < 0 || full < 0 || mutex < 0) {
++    printf("semaphore initialization failed\n");
++    exit(1);
++  }
++
++  pid = fork();
++
++  if (pid < 0) {
++    printf("fork failed\n");
++    exit(1);
++  }
++
++  if (pid == 0) {
++    consumer(s, empty, full, mutex);
++    exit(0);
++  }
++
++  producer(s, empty, full, mutex);
++
++  wait(0);
++
++  printf("Producer-Consumer test completed\n");
++
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index 29aad59..0c15f1b 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -25,6 +25,7 @@ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
+ int sync(void);
++uint64 shm_get(void);
+ 
+ // ulib.c
+ int stat(const char *, struct stat *);
+@@ -48,3 +49,7 @@ void printf(const char *, ...) __attribute__((format(printf, 1, 2)));
+ // umalloc.c
+ void *malloc(uint);
+ void free(void *);
++
++int sem_init(int);
++int sem_wait(int);
++int sem_signal(int);
+diff --git a/user/usys.pl b/user/usys.pl
+index 4d054e8..fffd755 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -43,3 +43,9 @@ entry("sbrk");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
++entry("shm_get");
++entry("sem_init");
++entry("sem_wait");
++entry("sem_signal");
++
++
+
+
+tets function 
+maybe i have 
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+
+#define BUF_SIZE 5
+#define ITEMS 20
+
+struct shared_buffer {
+  int buffer[BUF_SIZE];
+  int in;
+  int out;
+  int count;
+};
+
+void
+producer(struct shared_buffer *s, int empty, int full, int mutex)
+{
+  for (int item = 1; item <= ITEMS; item++) {
+
+    if (s->count == BUF_SIZE)
+      printf("Producer: buffer full, waiting...\n");
+
+    sem_wait(empty);
+    sem_wait(mutex);
+
+    s->buffer[s->in] = item;
+    s->in = (s->in + 1) % BUF_SIZE;
+    s->count++;
+
+    printf("Producer: produced %d (count=%d)\n",
+           item, s->count);
+
+    sem_signal(mutex);
+    sem_signal(full);
+
+  }
+
+  printf("Producer: finished\n");
+}
+
+void
+consumer(struct shared_buffer *s, int empty, int full, int mutex)
+{
+  for (int i = 1; i <= ITEMS; i++) {
+
+    if (s->count == 0)
+      printf("Consumer: buffer empty, waiting...\n");
+
+    sem_wait(full);
+    sem_wait(mutex);
+
+    int item = s->buffer[s->out];
+
+    s->out = (s->out + 1) % BUF_SIZE;
+    s->count--;
+
+    printf("Consumer: consumed %d (count=%d)\n",
+           item, s->count);
+
+    sem_signal(mutex);
+    sem_signal(empty);
+
+  }
+
+  printf("Consumer: finished\n");
+}
+
+int
+main(void)
+{
+  struct shared_buffer *s;
+  uint64 addr;
+  int empty, full, mutex;
+  int pid;
+
+  addr = shm_get();
+
+  if (addr == 0) {
+    printf("shm_get failed\n");
+    exit(1);
+  }
+
+  s = (struct shared_buffer *)addr;
+
+  s->in = 0;
+  s->out = 0;
+  s->count = 0;
+
+  empty = sem_init(BUF_SIZE);
+  full = sem_init(0);
+  mutex = sem_init(1);
+
+  if (empty < 0 || full < 0 || mutex < 0) {
+    printf("semaphore initialization failed\n");
+    exit(1);
+  }
+
+  pid = fork();
+
+  if (pid < 0) {
+    printf("fork failed\n");
+    exit(1);
+  }
+
+  if (pid == 0) {
+    consumer(s, empty, full, mutex);
+    exit(0);
+  }
+
+  producer(s, empty, full, mutex);
+
+  wait(0);
+
+  printf("Producer-Consumer test completed\n");
+
+  exit(0);
+}
